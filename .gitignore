@@ -1,0 +1,31 @@
+# Genomic data never enters the repository.
+*.vcf
+*.vcf.gz
+*.bcf
+*.tbi
+*.csi
+*.vcz/
+*.zarr/
+*.bam
+*.cram
+*.fa
+*.fa.gz
+*.fasta
+*.fasta.gz
+*.fai
+# Consumer array exports
+*raw_data*.txt
+genome_*.txt
+
+# Fixtures and synthetic genomes are the exception.
+!tests/data/**
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
