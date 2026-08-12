@@ -1,0 +1,39 @@
+[project]
+name = "acgt"
+version = "0.0.1"
+description = "Open source, open read: vectorized personal genomics, agent-ready, private by architecture"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.13"
+dependencies = [
+    "zarr",
+    "numcodecs",
+    "numpy",
+    "xarray",
+    "textual",
+    "cyvcf2",
+]
+
+[project.scripts]
+acgt = "acgt.tui:main"
+
+[dependency-groups]
+dev = [
+    "pytest",
+    "ruff",
+    "ty",
+    "import-linter",
+    "bio2zarr",
+    "vcztools",
+]
+
+[build-system]
+requires = ["uv_build>=0.8,<0.9"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+# The package sits flat at the repository root, not under src/.
+module-root = ""
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
