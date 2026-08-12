@@ -25,6 +25,8 @@ dev = [
     "import-linter",
     "bio2zarr",
     "vcztools",
+    "pytest-cov>=7.1.0",
+    "pre-commit>=4.6.2",
 ]
 
 [build-system]
