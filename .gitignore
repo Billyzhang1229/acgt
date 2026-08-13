@@ -1,0 +1,43 @@
+# Genomic data never enters the repository.
+*.vcf
+*.vcf.gz
+*.bcf
+*.tbi
+*.csi
+*.vcz/
+*.zarr/
+*.bam
+*.bai
+*.cram
+*.crai
+*.fastq
+*.fastq.gz
+*.fq
+*.fq.gz
+*.fa
+*.fa.gz
+*.fasta
+*.fasta.gz
+*.fai
+# Consumer array exports
+*raw_data*.txt
+genome_*.txt
+AncestryDNA*.txt
+
+# Fixtures and synthetic genomes are the exception. Everything under this path
+# is re-included, so nothing mechanical stops a real genome dropped in here —
+# that protection is AGENTS.md's rule, not this file's.
+!tests/data/**
+
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
