@@ -104,14 +104,18 @@ KIND_INT = "int"
 KIND_FLOAT = "float"
 KIND_BOOL = "bool"
 KIND_STR = "str"
-KINDS = frozenset({KIND_INT, KIND_FLOAT, KIND_BOOL, KIND_STR})
+# VCF Character is its own kind: exactly one character, which the spec
+# stores as a fixed-width U1 rather than a variable-length string. Folding
+# it into str would be lossless on the way in and wrong on the way out.
+KIND_CHAR = "char"
+KINDS = frozenset({KIND_INT, KIND_FLOAT, KIND_BOOL, KIND_STR, KIND_CHAR})
 
 _VCF_TYPE_TO_KIND = {
     "Integer": KIND_INT,
     "Float": KIND_FLOAT,
     "Flag": KIND_BOOL,
     "String": KIND_STR,
-    "Character": KIND_STR,
+    "Character": KIND_CHAR,
 }
 
 
@@ -228,15 +232,18 @@ REQUIRED_ARRAYS = frozenset(
 )
 
 
-def spec_for_field(category, name, number, vcf_type) -> ArraySpec:
+def spec_for_field(category, name, number, vcf_type, description="") -> ArraySpec:
     """Map one VCF INFO or FORMAT header declaration to an ArraySpec.
 
     `number` is the raw VCF Number string: a count, "A", "R", "G", or ".".
     A/R/G map to the reserved dimensions the spec assigns them; a fixed count
     above one and "." get a dimension named for the field, sized at
-    conversion time. FORMAT/GT is not a field — it becomes call_genotype,
-    already in FIXED_ARRAYS — so asking for it is an error, as is any field
-    whose generated name would collide with a fixed array.
+    conversion time. `description` is the header's Description text; it
+    travels to the store as the array's `description` attribute, which is
+    what the reference reader uses to rebuild the header line on the way
+    back out. FORMAT/GT is not a field — it becomes call_genotype, already
+    in FIXED_ARRAYS — so asking for it is an error, as is any field whose
+    generated name would collide with a fixed array.
     """
     if category not in ("INFO", "FORMAT"):
         raise ValueError(f"category must be INFO or FORMAT, got {category!r}")
@@ -270,7 +277,7 @@ def spec_for_field(category, name, number, vcf_type) -> ArraySpec:
         # A fixed count above one, or "." meaning the header does not say.
         dims.append(f"{category}_{name}_dim")
 
-    return ArraySpec(zarr_name, kind, tuple(dims))
+    return ArraySpec(zarr_name, kind, tuple(dims), description)
 
 
 # --------------------------------------------------------------------------

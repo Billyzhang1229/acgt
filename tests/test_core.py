@@ -118,9 +118,10 @@ class TestSpecForField:
         s = core.spec_for_field("FORMAT", "XX", "2", "Integer")
         assert s.dims == ("variants", "samples", "FORMAT_XX_dim")
 
-    def test_character_is_str(self):
+    def test_character_is_its_own_kind(self):
         s = core.spec_for_field("INFO", "C", "1", "Character")
-        assert s.kind == core.KIND_STR
+        assert s.kind == core.KIND_CHAR
+        assert s.kind != core.spec_for_field("INFO", "S", "1", "String").kind
 
     def test_info_name_colliding_with_fixed_array_is_rejected(self):
         with pytest.raises(ValueError, match="variant_position"):
