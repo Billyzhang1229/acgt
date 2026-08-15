@@ -111,6 +111,7 @@ acgt/                repository root
     acgt.tcss        Textual stylesheet
   tests/
     data/            fixtures and synthetic genomes — never real data
+  benchmark/         timing scripts; input is generated, never committed
   docs/
 ```
 
