@@ -11,6 +11,8 @@ dependencies; the application never sees them.
 
 import io
 import logging
+import shutil
+import subprocess
 
 import bio2zarr.vcf as b2z
 import numpy as np
@@ -311,3 +313,159 @@ def test_stored_schema_carries_provenance(sample_store):
     assert schema.source == "sample.vcf.gz"
     assert schema.build == "GRCh38"
     assert schema.dims[core.DIM_PLOIDY] == 2
+
+
+# --------------------------------------------------------------------------
+# parallel scan and fill
+# --------------------------------------------------------------------------
+# The fixtures are far below the size at which from_vcf picks the parallel
+# path on its own, so every test here forces it with an explicit `workers`.
+# What the tests hold is that the parallel path writes the same store the
+# serial one does; the serial path's agreement with the oracle then carries
+# over.
+
+
+@pytest.mark.parametrize("fixture", ["sample_vcf", "sample_bcf"])
+def test_parallel_matches_serial(fixture, request, tmp_path):
+    src = request.getfixturevalue(fixture)
+    serial = convert.from_vcf(src, tmp_path / "serial.vcz", chunk_size=CHUNK, workers=1)
+    parallel = convert.from_vcf(
+        src, tmp_path / "parallel.vcz", chunk_size=CHUNK, workers=2
+    )
+    assert dataset.preflight(parallel, deep=True) == []
+    assert_stores_equal(parallel, serial)
+
+
+def test_parallel_matches_oracle(sample_vcf, tmp_path):
+    ours = convert.from_vcf(
+        sample_vcf, tmp_path / "ours.vcz", chunk_size=CHUNK, workers=2
+    )
+    theirs = oracle_store(sample_vcf, tmp_path / "oracle.vcz")
+    assert_stores_equal(ours, theirs)
+    assert view(ours) == view(theirs)
+
+
+def test_partition_boundary_counts_a_spanning_deletion_once(
+    sample_vcf, tmp_path, monkeypatch
+):
+    # chr2:150 AACG>A spans 150-153. A region query returns every record
+    # overlapping the window, so with a boundary at 150|151 the deletion is
+    # handed to both partitions; assigning by POS must keep it in one.
+    monkeypatch.setattr(convert, "PARTITION_WINDOW", 150)
+    serial = convert.from_vcf(
+        sample_vcf, tmp_path / "serial.vcz", chunk_size=CHUNK, workers=1
+    )
+    parallel = convert.from_vcf(
+        sample_vcf, tmp_path / "parallel.vcz", chunk_size=CHUNK, workers=3
+    )
+    assert dataset.preflight(parallel, deep=True) == []
+    assert_stores_equal(parallel, serial)
+
+
+def test_unindexed_file_falls_back_to_serial(mini_vcf, tmp_path):
+    # no .tbi/.csi: nothing to seek by, so workers=4 still runs serially and
+    # the store comes out the same
+    assert convert._plan_parallel(mini_vcf, 4, ["chr1"], [1000000]) is None
+    ours = convert.from_vcf(
+        mini_vcf, tmp_path / "ours.vcz", chunk_size=CHUNK, workers=4
+    )
+    theirs = oracle_store(mini_vcf, tmp_path / "oracle.vcz")
+    assert_stores_equal(ours, theirs)
+
+
+def test_small_files_stay_serial_unless_asked(sample_vcf, sample_bcf):
+    contigs = ["chr1", "chr2", "chrM", "chrEmpty"]
+    lengths = [1000000, 800000, 16569, 5000]
+    # default workers: the fixture is far below PARALLEL_MIN_BYTES
+    assert convert._plan_parallel(sample_vcf, None, contigs, lengths) is None
+    # explicit workers: the parallel path is planned; the tabix index names
+    # only the contigs that have records, in file order, and chrEmpty is
+    # never queried; the BCF's CSI names nothing, so the header order is used
+    assert [p[0] for p in convert._plan_parallel(sample_vcf, 2, contigs, lengths)] == [
+        "chr1",
+        "chr2",
+        "chrM",
+    ]
+    assert [
+        p[0] for p in convert._plan_parallel(sample_bcf, 2, contigs, lengths)
+    ] == contigs
+
+
+def test_index_contigs_read_from_tbi_and_csi(sample_vcf, sample_bcf):
+    assert convert._index_contigs(convert._index_file(sample_vcf)) == [
+        "chr1",
+        "chr2",
+        "chrM",
+    ]
+    assert convert._index_contigs(convert._index_file(sample_bcf)) is None
+
+
+def test_partitions_cover_each_contig_to_the_end_of_coordinates():
+    parts = convert._partitions(["a", "b", "c"], [250, 100, -1], window=100)
+    # windows are inclusive on both ends and adjacent windows do not overlap;
+    # the last window of every contig is open-ended so a wrong header length
+    # cannot drop records
+    assert parts == [
+        ("a", 1, 100),
+        ("a", 101, 200),
+        ("a", 201, convert._HTS_MAX_POS),
+        ("b", 1, convert._HTS_MAX_POS),
+        ("c", 1, convert._HTS_MAX_POS),
+    ]
+
+
+def test_index_named_contig_converts_the_same_on_both_paths(
+    undeclared_contig_vcf, tmp_path
+):
+    # Once the file is tabix-indexed, htslib adds any contig the index names
+    # but the header does not to its in-memory header (with unknown length),
+    # so what the plain-text path rejects converts here -- and both of our
+    # paths have to see the same augmented header and write the same store.
+    bgzip, tabix = shutil.which("bgzip"), shutil.which("tabix")
+    if bgzip is None or tabix is None:
+        pytest.skip("bgzip/tabix not installed")
+    src = tmp_path / "undeclared.vcf.gz"
+    with src.open("wb") as fh:
+        subprocess.run([bgzip, "-c", undeclared_contig_vcf], stdout=fh, check=True)
+    subprocess.run([tabix, "-p", "vcf", src], check=True)
+    assert convert._index_contigs(convert._index_file(src)) == ["chr1", "chr9"]
+    serial = convert.from_vcf(src, tmp_path / "serial.vcz", chunk_size=CHUNK, workers=1)
+    parallel = convert.from_vcf(
+        src, tmp_path / "parallel.vcz", chunk_size=CHUNK, workers=2
+    )
+    assert store_arrays(serial)["contig_id"].tolist() == ["chr1", "chr9"]
+    assert_stores_equal(parallel, serial)
+    assert_stores_equal(parallel, oracle_store(src, tmp_path / "oracle.vcz"))
+
+
+def test_fill_refuses_a_count_that_disagrees_with_the_scan(sample_vcf):
+    # The scan sizes every partition's slice; a fill that yields a different
+    # count would write over the next partition's rows. Drive one worker
+    # in-process with an expected count the region cannot satisfy.
+    vcf = convert.VCF(sample_vcf)
+    fields, filters, _, has_gt, declared = convert._discover(vcf, ())
+    contigs = list(vcf.seqnames)
+    n, max_alt, observed, slen, idlen, ploidy = convert._scan(
+        sample_vcf, fields, has_gt, declared
+    )
+    n_alleles = max_alt + 1
+    convert._resolve_widths(fields, n_alleles, 6, observed)
+    contig_index = {c: i for i, c in enumerate(contigs)}
+    filter_index = {f: i for i, f in enumerate(filters)}
+    shared = convert._SharedBuffers()
+    try:
+        convert._allocate(
+            n, n_alleles, ploidy, len(filters), len(contigs), fields, slen, idlen,
+            48, has_gt, empty=shared.empty,
+        )  # fmt: skip
+        convert._worker_init(
+            sample_vcf, fields, has_gt, declared, contig_index, filter_index, 48
+        )
+        widths = [f.width for f in fields]
+        part = ("chr1", 1, convert._HTS_MAX_POS)  # holds 5 records
+        job = (part, 0, 4, shared.meta, widths, n_alleles, ploidy)
+        with pytest.raises(ValueError, match="changed underneath"):
+            convert._fill_partition(job)
+    finally:
+        convert._worker.clear()
+        shared.close()

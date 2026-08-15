@@ -12,19 +12,30 @@ converter, pays a per-record Python cost that amortises over the samples
 dimension, which makes one-sample files its worst case; this converter
 instead resolves the store's exact shape up front and fills preallocated
 columnar buffers. Two passes over the file: a scan that counts records and
-resolves the widths the header leaves undetermined, then a fill. Sentinel
-values follow bio2zarr bit for bit, so output is comparable array for array.
+resolves the widths the header leaves undetermined, then a fill. Both run
+in parallel over genomic windows when the file is indexed and large enough
+for that to pay; the exact per-window counts from the scan give each fill
+worker its own disjoint slice of shared-memory buffers. Sentinel values
+follow bio2zarr bit for bit, so output is comparable array for array.
 
 Not handled: multiple samples (rejected explicitly — cohort files are
 bio2zarr's territory), symbolic and breakend alleles beyond what cyvcf2
 reports verbatim.
 """
 
+import concurrent.futures
+import contextlib
 import dataclasses
+import gzip
 import logging
 import math
+import multiprocessing
+import os
 import re
+import struct
 import time
+import warnings
+from multiprocessing import shared_memory
 from pathlib import Path
 
 import numpy as np
@@ -150,7 +161,11 @@ def _observed_width(value):
     return 1
 
 
-def _scan(path, fields, has_genotypes, declared):
+def _open_fields(fields):
+    return [f for f in fields if f.vector and f.number not in ("A", "R")]
+
+
+def _scan_records(records, open_fields, has_genotypes):
     """Count records and observe everything the header leaves open: the
     number of alternate alleles, ploidy, string lengths, and the width of
     every Number=. field.
@@ -160,15 +175,13 @@ def _scan(path, fields, has_genotypes, declared):
     chunk's first and last position as its bounds, so unsorted input would
     not fail — it would silently produce region queries that miss variants.
     """
-    open_fields = [f for f in fields if f.vector and f.number not in ("A", "R")]
     widths = dict.fromkeys(((f.category, f.name) for f in open_fields), 1)
     n = max_alt = 0
     max_slen = max_idlen = max_ploidy = 1
     current_chrom = None
     current_pos = 0
     seen_chroms = set()
-    vcf = VCF(path)
-    for v in vcf:
+    for v in records:
         n += 1
         if current_chrom != v.CHROM:
             if v.CHROM in seen_chroms:
@@ -199,23 +212,38 @@ def _scan(path, fields, has_genotypes, declared):
             if x is not None:
                 key = (f.category, f.name)
                 widths[key] = max(widths[key], _observed_width(x))
-    # htslib adds any field the records use without a declaration to its
-    # in-memory header as it parses; comparing afterwards is how we learn
-    # about them. The reference implementation drops such fields silently,
-    # and output stays comparable to it, but not without saying so.
-    undeclared = sorted(
+    return n, max_alt, widths, max_slen, max_idlen, max_ploidy
+
+
+def _undeclared_fields(vcf, declared):
+    """htslib adds any field the records use without a declaration to its
+    in-memory header as it parses; comparing afterwards is how we learn
+    about them. Only meaningful after the handle has read records."""
+    return {
         f"{d['HeaderType']}/{d['ID']}"
         for d in _header_records(vcf)
         if d.get("HeaderType") in ("INFO", "FORMAT")
         and (d["HeaderType"], d["ID"]) not in declared
-    )
+    }
+
+
+def _warn_undeclared(undeclared):
+    # The reference implementation drops such fields silently, and output
+    # stays comparable to it, but not without saying so.
     if undeclared:
         log.warning(
             "records use INFO/FORMAT fields the header never declared, "
             "and they are not converted: %s",
-            ", ".join(undeclared),
+            ", ".join(sorted(undeclared)),
         )
-    return n, max_alt, widths, max_slen, max_idlen, max_ploidy
+
+
+def _scan(path, fields, has_genotypes, declared):
+    """The scan pass over a whole file, serially."""
+    vcf = VCF(path)
+    stats = _scan_records(vcf, _open_fields(fields), has_genotypes)
+    _warn_undeclared(_undeclared_fields(vcf, declared))
+    return stats
 
 
 def _resolve_widths(fields, n_alleles, max_genotypes, observed):
@@ -239,38 +267,60 @@ def _resolve_widths(fields, n_alleles, max_genotypes, observed):
 # --------------------------------------------------------------------------
 # fill pass
 # --------------------------------------------------------------------------
+def _numpy_empty(name, shape, dtype):
+    return np.empty(shape, dtype)
+
+
 def _allocate(
-    n, n_alleles, ploidy, n_filters, n_contigs, fields, slen, idlen, cap, has_genotypes
+    n,
+    n_alleles,
+    ploidy,
+    n_filters,
+    n_contigs,
+    fields,
+    slen,
+    idlen,
+    cap,
+    has_genotypes,
+    empty=None,
 ):
+    """Preallocate every per-variant buffer at its final shape. `empty` is
+    np.empty for the serial path and a shared-memory allocator for the
+    parallel one; either way the arrays come back as plain ndarrays."""
+    empty = empty or _numpy_empty
     contig_dtype = "i2" if n_contigs <= np.iinfo("i2").max else "i4"
     arrays = {
-        "variant_position": np.empty((n,), "i4"),
-        "variant_contig": np.empty((n,), contig_dtype),
-        "variant_quality": np.empty((n,), "f4"),
-        "variant_id": np.empty((n,), f"S{min(idlen, cap)}"),
-        "variant_allele": np.empty((n, n_alleles), f"S{min(slen, cap)}"),
-        "variant_length": np.empty((n,), "i4"),
-        "variant_filter": np.zeros((n, max(1, n_filters)), "b1"),
+        "variant_position": empty("variant_position", (n,), "i4"),
+        "variant_contig": empty("variant_contig", (n,), contig_dtype),
+        "variant_quality": empty("variant_quality", (n,), "f4"),
+        "variant_id": empty("variant_id", (n,), f"S{min(idlen, cap)}"),
+        "variant_allele": empty("variant_allele", (n, n_alleles), f"S{min(slen, cap)}"),
+        "variant_length": empty("variant_length", (n,), "i4"),
+        "variant_filter": empty("variant_filter", (n, max(1, n_filters)), "b1"),
     }
+    arrays["variant_filter"][:] = False
     if has_genotypes:
         gt_dtype = "i1" if n_alleles <= np.iinfo("i1").max else "i2"
-        arrays["call_genotype"] = np.empty((n, 1, ploidy), gt_dtype)
-        arrays["call_genotype_phased"] = np.empty((n, 1), "b1")
+        arrays["call_genotype"] = empty("call_genotype", (n, 1, ploidy), gt_dtype)
+        arrays["call_genotype_phased"] = empty("call_genotype_phased", (n, 1), "b1")
     for f in fields:
         shape = (n,) if f.category == "INFO" else (n, 1)
         if f.vector:
             shape = (*shape, f.width)
         dtype = f"S{cap}" if f.dtype == "O" else f.dtype
-        arrays[f.spec.name] = np.empty(shape, dtype)
+        arrays[f.spec.name] = empty(f.spec.name, shape, dtype)
     return arrays
 
 
-def _fill(path, arrays, fields, contig_index, filter_index, n_alleles, ploidy, cap):
-    """One pass writing every record into the preallocated buffers.
+def _fill(
+    records, start, arrays, fields, contig_index, filter_index, n_alleles, ploidy, cap
+):
+    """Write `records` into the preallocated buffers from row `start` on.
 
     The per-field work is flattened into (array, kind, ...) tuples so the
     record loop does no attribute lookups; strings longer than the inline
-    cap go to the spill dict instead of widening every row.
+    cap go to the spill dict instead of widening every row. Returns the
+    number of records written and the spill dict, keyed by absolute index.
     """
     INFO_FLAG, INFO_SCALAR, INFO_VECTOR, FMT_SCALAR, FMT_VECTOR = range(5)
     ops = []
@@ -305,7 +355,9 @@ def _fill(path, arrays, fields, contig_index, filter_index, n_alleles, ploidy, c
         else:
             arr[index] = value.encode()
 
-    for i, v in enumerate(VCF(path)):
+    i = start - 1
+    for v in records:
+        i += 1
         pos[i] = v.POS
         try:
             contig[i] = contig_index[v.CHROM]
@@ -473,7 +525,7 @@ def _fill(path, arrays, fields, contig_index, filter_index, n_alleles, ploidy, c
                         arr[i, 0, m:] = (
                             core.INT_FILL if dtype == "i4" else core.FLOAT32_FILL
                         )
-    return spill
+    return i + 1 - start, spill
 
 
 _VCF_INT_MISSING = np.iinfo(np.int32).min
@@ -498,6 +550,231 @@ def _bytes_array(values):
 
 
 # --------------------------------------------------------------------------
+# parallel scan and fill
+# --------------------------------------------------------------------------
+# The two passes are embarrassingly parallel once the file is cut into
+# genomic windows: the scan reduces per-window counts and maxima, and the
+# exact per-window counts give every fill worker its own disjoint slice of
+# the preallocated buffers to write into. Workers hold the buffers in
+# shared memory, so nothing but the small spill dict crosses a process
+# boundary. This needs an index (.tbi or .csi) to seek by region; without
+# one the serial path runs.
+
+PARTITION_WINDOW = 10_000_000  # bases per partition
+PARALLEL_MIN_BYTES = 2**20  # below ~1 MiB, process start-up outweighs the gain
+_HTS_MAX_POS = 2**31 - 1
+
+
+def _index_file(path):
+    for suffix in (".tbi", ".csi"):
+        candidate = Path(f"{path}{suffix}")
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def _index_contigs(index):
+    """The contig names an index carries, in the order they occur in the
+    file, or None when it carries none. tabix writes them into both .tbi and
+    .csi; bcftools' CSI for a BCF does not, since BCF records name contigs by
+    header position and cannot mention an undeclared one."""
+    with gzip.open(index, "rb") as fh:
+        magic = fh.read(4)
+        if magic == b"TBI\1":
+            fh.read(4 * 7)  # n_ref, format, col_seq, col_beg, col_end, meta, skip
+        elif magic == b"CSI\1":
+            fh.read(4 * 2)  # min_shift, depth
+            (l_aux,) = struct.unpack("<i", fh.read(4))
+            if l_aux < 4 * 7:
+                return None
+            fh.read(4 * 6)  # format, col_seq, col_beg, col_end, meta, skip
+        else:
+            return None
+        (l_nm,) = struct.unpack("<i", fh.read(4))
+        return [name.decode() for name in fh.read(l_nm).split(b"\0") if name]
+
+
+def _partitions(contigs, lengths, window=None):
+    """(contig, start, end) windows covering every listed contig, bounds
+    inclusive. The last window of a contig runs to the end of the coordinate
+    space rather than to the header length, so a wrong or missing length
+    cannot truncate the contig."""
+    window = window or PARTITION_WINDOW
+    parts = []
+    for name, length in zip(contigs, lengths, strict=True):
+        starts = range(1, max(length, 1) + 1, window)
+        for start in starts:
+            end = _HTS_MAX_POS if start == starts[-1] else start + window - 1
+            parts.append((name, start, end))
+    return parts
+
+
+def _region(contig, start, end):
+    # braces keep htslib from misreading contig names that contain ':'
+    return f"{{{contig}}}:{start}-{end}"
+
+
+def _bounded(records, start, end):
+    """Records whose POS lies in [start, end]. A region query returns every
+    record *overlapping* the window, so a deletion that begins before it
+    would show up again in the next window; keying on POS assigns each
+    record to exactly one partition."""
+    for v in records:
+        if start > v.POS:
+            continue
+        if end < v.POS:
+            break
+        yield v
+
+
+class _SharedBuffers:
+    """Named shared-memory blocks the parent allocates and workers attach to.
+
+    `empty` has the signature `_allocate` expects of its allocator; `meta`
+    is what a worker needs to map the same blocks by name.
+    """
+
+    def __init__(self):
+        self.blocks = []
+        self.meta = {}
+
+    def empty(self, name, shape, dtype):
+        dtype = np.dtype(dtype)
+        nbytes = max(1, dtype.itemsize * math.prod(shape))
+        shm = shared_memory.SharedMemory(create=True, size=nbytes)
+        self.blocks.append(shm)
+        self.meta[name] = (shm.name, tuple(shape), dtype.str)
+        return np.ndarray(shape, dtype, buffer=shm.buf)
+
+    def close(self):
+        # unlink first: the memory stays mapped until every view is gone, and
+        # what matters is that the name does not outlive the conversion
+        for shm in self.blocks:
+            with contextlib.suppress(FileNotFoundError):
+                shm.unlink()
+            with contextlib.suppress(BufferError):
+                shm.close()
+
+
+# Per-worker state, set once by the pool initializer and reused across
+# every partition the worker handles: one cyvcf2 handle, and the shared
+# buffers once the fill pass has told the worker their names.
+_worker = {}
+
+
+def _worker_init(
+    path, fields, has_genotypes, declared, contig_index, filter_index, cap
+):
+    warnings.filterwarnings("ignore", message=".*no intervals found.*")
+    _worker.update(
+        vcf=VCF(path),
+        fields=fields,
+        open_fields=_open_fields(fields),
+        has_genotypes=has_genotypes,
+        declared=declared,
+        contig_index=contig_index,
+        filter_index=filter_index,
+        cap=cap,
+        handles=[],
+        arrays=None,
+    )
+
+
+def _worker_arrays(meta):
+    if _worker["arrays"] is None:
+        arrays = {}
+        for name, (shm_name, shape, dtype) in meta.items():
+            shm = shared_memory.SharedMemory(name=shm_name, track=False)
+            _worker["handles"].append(shm)  # keeps the mapping alive
+            arrays[name] = np.ndarray(shape, np.dtype(dtype), buffer=shm.buf)
+        _worker["arrays"] = arrays
+    return _worker["arrays"]
+
+
+def _scan_partition(part):
+    contig, start, end = part
+    vcf = _worker["vcf"]
+    records = _bounded(vcf(_region(contig, start, end)), start, end)
+    stats = _scan_records(records, _worker["open_fields"], _worker["has_genotypes"])
+    return stats, _undeclared_fields(vcf, _worker["declared"])
+
+
+def _fill_partition(job):
+    part, lo, expected, meta, widths, n_alleles, ploidy = job
+    contig, start, end = part
+    vcf = _worker["vcf"]
+    # the worker's copy of the fields predates the scan; the widths the scan
+    # resolved arrive with the job
+    for f, width in zip(_worker["fields"], widths, strict=True):
+        f.width = width
+    records = _bounded(vcf(_region(contig, start, end)), start, end)
+    written, spill = _fill(
+        records,
+        lo,
+        _worker_arrays(meta),
+        _worker["fields"],
+        _worker["contig_index"],
+        _worker["filter_index"],
+        n_alleles,
+        ploidy,
+        _worker["cap"],
+    )
+    if written != expected:
+        # the scan sized this slice; writing past it would overwrite the
+        # next partition's rows silently
+        raise ValueError(
+            f"{contig}:{start}-{end} yielded {written} records on the fill "
+            f"pass but {expected} on the scan; the file changed underneath us"
+        )
+    return spill
+
+
+def _plan_parallel(path, workers, contigs, contig_lengths):
+    """Partitions for the parallel path, or None when the serial path should
+    run: one worker asked for, no index to seek with, or -- with `workers`
+    left to default -- a file small enough that process start-up would
+    outweigh the gain. An explicit `workers` forces the parallel path."""
+    if workers == 1:
+        return None
+    index = _index_file(path)
+    if index is None:
+        return None
+    if workers is None and Path(path).stat().st_size < PARALLEL_MIN_BYTES:
+        return None
+    lengths = dict(zip(contigs, contig_lengths, strict=False))
+    ordered = _index_contigs(index)
+    if ordered is None:
+        # BCF: the index names nothing, so windows follow the header. A file
+        # whose contigs are stored in another order still converts; only the
+        # row order differs from the serial path's.
+        ordered = contigs
+    else:
+        unknown = [c for c in ordered if c not in lengths]
+        if unknown:
+            raise ValueError(
+                f"record contig {unknown[0]!r} is not declared in the header"
+            )
+    return _partitions(ordered, [lengths.get(c, -1) for c in ordered])
+
+
+def _reduce_scan(results):
+    n = max_alt = 0
+    max_slen = max_idlen = max_ploidy = 1
+    widths = {}
+    undeclared = set()
+    for (pn, palt, pw, pslen, pidlen, pploidy), pundeclared in results:
+        n += pn
+        max_alt = max(max_alt, palt)
+        max_slen = max(max_slen, pslen)
+        max_idlen = max(max_idlen, pidlen)
+        max_ploidy = max(max_ploidy, pploidy)
+        for k, w in pw.items():
+            widths[k] = max(widths.get(k, 1), w)
+        undeclared |= pundeclared
+    return (n, max_alt, widths, max_slen, max_idlen, max_ploidy), undeclared
+
+
+# --------------------------------------------------------------------------
 # public conversion paths
 # --------------------------------------------------------------------------
 def from_vcf(
@@ -510,6 +787,7 @@ def from_vcf(
     string_cap=DEFAULT_STRING_CAP,
     compress_level=5,
     overwrite=False,
+    workers=None,
 ) -> Path:
     """Convert a single-sample VCF or BCF at `path` into a VCZ store at `out`.
 
@@ -520,6 +798,13 @@ def from_vcf(
     about that choice lives in dataset.py. An existing `out` is refused
     unless `overwrite` says otherwise — checked here, before the scan, so a
     long conversion cannot fail at the very end on it.
+
+    Both passes run in parallel over genomic windows when the file has a
+    tabix or CSI index and is large enough for that to pay off; `workers`
+    sets the process count (default: up to 8, one per core), 1 forces the
+    serial path, and any other explicit value forces the parallel one. The
+    output is the same either way for a sorted file; see _plan_parallel for
+    the one BCF ordering caveat.
     """
     t0 = time.perf_counter()
     if Path(out).exists() and not overwrite:
@@ -545,100 +830,148 @@ def from_vcf(
     except AttributeError:
         contig_lengths = []
 
-    n, max_alt, observed, slen, idlen, ploidy = _scan(
-        path, fields, has_genotypes, declared
-    )
-    n_alleles = max(2, max_alt + 1)
-    # the genotypes dimension is the multiset coefficient the reference uses,
-    # but GT-derived ploidy undercounts records carrying PL without GT, so
-    # the widest Number=G value observed sets a floor
-    widest_g = max(
-        (observed.get((f.category, f.name), 1) for f in fields if f.number == "G"),
-        default=1,
-    )
-    formula = math.comb(n_alleles + ploidy - 1, ploidy) if has_genotypes else 1
-    max_genotypes = max(formula, widest_g)
-    _resolve_widths(fields, n_alleles, max_genotypes, observed)
-    log.info("scanned %s: %d variants, %d fields", path, n, len(fields))
-
-    arrays = _allocate(
-        n,
-        n_alleles,
-        ploidy,
-        len(filters),
-        len(contigs),
-        fields,
-        slen,
-        idlen,
-        string_cap,
-        has_genotypes,
-    )
+    partitions = _plan_parallel(path, workers, contigs, contig_lengths)
     contig_index = {c: i for i, c in enumerate(contigs)}
     filter_index = {f: i for i, f in enumerate(filters)}
-    spill = _fill(
-        path,
-        arrays,
-        fields,
-        contig_index,
-        filter_index,
-        n_alleles,
-        ploidy,
-        string_cap,
-    )
-    _remap_sentinels(arrays, fields)
-    if "call_genotype" in arrays:
-        if ploidy == 1:
-            # bio2zarr's rule, kept for array-for-array parity: a store
-            # whose every call is haploid marks all of them phased
-            arrays["call_genotype_phased"][:] = True
-        arrays["call_genotype_mask"] = arrays["call_genotype"] < 0
-    arrays["variant_id_mask"] = arrays["variant_id"] == b"."
-    arrays["sample_id"] = _bytes_array(samples)
-    arrays["contig_id"] = _bytes_array(contigs)
-    # cyvcf2 reports an unknown contig length as -1; contig_length is an
-    # optional array, so any unknown omits it, the way the reference does
-    if len(contig_lengths) == len(contigs) and min(contig_lengths, default=0) > 0:
-        arrays["contig_length"] = np.array(contig_lengths, dtype="i8")
-    arrays["filter_id"] = _bytes_array(filters)
-    arrays["filter_description"] = _bytes_array(
-        [descriptions.get(f, "") for f in filters]
-    )
+    shared = None
+    pool = None
+    try:
+        if partitions is None:
+            stats = _scan(path, fields, has_genotypes, declared)
+        else:
+            pool = concurrent.futures.ProcessPoolExecutor(
+                workers or min(8, os.process_cpu_count() or 1),
+                mp_context=multiprocessing.get_context("spawn"),
+                initializer=_worker_init,
+                initargs=(
+                    path,
+                    fields,
+                    has_genotypes,
+                    declared,
+                    contig_index,
+                    filter_index,
+                    string_cap,
+                ),
+            )
+            per_partition = list(pool.map(_scan_partition, partitions, chunksize=4))
+            stats, undeclared = _reduce_scan(per_partition)
+            _warn_undeclared(undeclared)
+            counts = [st[0] for st, _ in per_partition]
+            shared = _SharedBuffers()
+        n, max_alt, observed, slen, idlen, ploidy = stats
+        n_alleles = max(2, max_alt + 1)
+        # the genotypes dimension is the multiset coefficient the reference uses,
+        # but GT-derived ploidy undercounts records carrying PL without GT, so
+        # the widest Number=G value observed sets a floor
+        widest_g = max(
+            (observed.get((f.category, f.name), 1) for f in fields if f.number == "G"),
+            default=1,
+        )
+        formula = math.comb(n_alleles + ploidy - 1, ploidy) if has_genotypes else 1
+        max_genotypes = max(formula, widest_g)
+        _resolve_widths(fields, n_alleles, max_genotypes, observed)
+        log.info("scanned %s: %d variants, %d fields", path, n, len(fields))
 
-    dims = {
-        core.DIM_VARIANTS: n,
-        core.DIM_SAMPLES: 1,
-        core.DIM_ALLELES: n_alleles,
-        core.DIM_FILTERS: len(filters),
-        core.DIM_CONTIGS: len(contigs),
-    }
-    if "call_genotype" in arrays:
-        dims[core.DIM_PLOIDY] = ploidy
-    for f in fields:
-        for dim in f.spec.dims:
-            if dim == core.DIM_ALT_ALLELES:
-                dims[dim] = n_alleles - 1
-            elif dim == core.DIM_GENOTYPES:
-                dims[dim] = max_genotypes
-            elif dim not in dims:
-                dims[dim] = f.width
-    fixed = tuple(spec for name, spec in core.FIXED_ARRAYS.items() if name in arrays)
-    schema = core.Schema(
-        dims=dims,
-        fields=fixed + tuple(f.spec for f in fields),
-        source=Path(path).name,
-        build=build,
-    )
+        arrays = _allocate(
+            n,
+            n_alleles,
+            ploidy,
+            len(filters),
+            len(contigs),
+            fields,
+            slen,
+            idlen,
+            string_cap,
+            has_genotypes,
+            empty=shared.empty if shared is not None else _numpy_empty,
+        )
+        if pool is None or shared is None:  # both set together: the serial path
+            _, spill = _fill(
+                VCF(path),
+                0,
+                arrays,
+                fields,
+                contig_index,
+                filter_index,
+                n_alleles,
+                ploidy,
+                string_cap,
+            )
+        else:
+            offsets = np.concatenate([[0], np.cumsum(counts)[:-1]])
+            widths = [f.width for f in fields]
+            jobs = [
+                (part, int(lo), int(count), shared.meta, widths, n_alleles, ploidy)
+                for part, lo, count in zip(partitions, offsets, counts, strict=True)
+                if count
+            ]
+            spill = {}
+            for partial in pool.map(_fill_partition, jobs, chunksize=2):
+                spill.update(partial)
+        _remap_sentinels(arrays, fields)
+        if "call_genotype" in arrays:
+            if ploidy == 1:
+                # bio2zarr's rule, kept for array-for-array parity: a store
+                # whose every call is haploid marks all of them phased
+                arrays["call_genotype_phased"][:] = True
+            arrays["call_genotype_mask"] = arrays["call_genotype"] < 0
+        arrays["variant_id_mask"] = arrays["variant_id"] == b"."
+        arrays["sample_id"] = _bytes_array(samples)
+        arrays["contig_id"] = _bytes_array(contigs)
+        # contig_length is optional. cyvcf2's seqlens raises when the header
+        # declares contigs without lengths, and the array is omitted then;
+        # when it answers, the array is written as is, including the -1 it
+        # reports for a contig the index named but the header did not --
+        # the reference implementation's rule exactly
+        if len(contig_lengths) == len(contigs):
+            arrays["contig_length"] = np.array(contig_lengths, dtype="i8")
+        arrays["filter_id"] = _bytes_array(filters)
+        arrays["filter_description"] = _bytes_array(
+            [descriptions.get(f, "") for f in filters]
+        )
 
-    dataset.save(
-        arrays,
-        schema,
-        out,
-        zarr_format=zarr_format,
-        chunk_size=chunk_size,
-        compress_level=compress_level,
-        spill=spill,
-        overwrite=overwrite,
-        meta_information=meta_information,
-    )
-    log.info("converted %s -> %s in %.2fs", path, out, time.perf_counter() - t0)
-    return Path(out)
+        dims = {
+            core.DIM_VARIANTS: n,
+            core.DIM_SAMPLES: 1,
+            core.DIM_ALLELES: n_alleles,
+            core.DIM_FILTERS: len(filters),
+            core.DIM_CONTIGS: len(contigs),
+        }
+        if "call_genotype" in arrays:
+            dims[core.DIM_PLOIDY] = ploidy
+        for f in fields:
+            for dim in f.spec.dims:
+                if dim == core.DIM_ALT_ALLELES:
+                    dims[dim] = n_alleles - 1
+                elif dim == core.DIM_GENOTYPES:
+                    dims[dim] = max_genotypes
+                elif dim not in dims:
+                    dims[dim] = f.width
+        fixed = tuple(
+            spec for name, spec in core.FIXED_ARRAYS.items() if name in arrays
+        )
+        schema = core.Schema(
+            dims=dims,
+            fields=fixed + tuple(f.spec for f in fields),
+            source=Path(path).name,
+            build=build,
+        )
+
+        dataset.save(
+            arrays,
+            schema,
+            out,
+            zarr_format=zarr_format,
+            chunk_size=chunk_size,
+            compress_level=compress_level,
+            spill=spill,
+            overwrite=overwrite,
+            meta_information=meta_information,
+        )
+        log.info("converted %s -> %s in %.2fs", path, out, time.perf_counter() - t0)
+        return Path(out)
+    finally:
+        if pool is not None:
+            pool.shutdown()
+        if shared is not None:
+            shared.close()

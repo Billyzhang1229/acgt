@@ -33,7 +33,10 @@ uv run python benchmark/bench_convert.py --vcf benchmark/data/synthetic.vcf.gz
 ```
 
 The default sizes are 10k, 100k, and 1M records. `--vcf` times an existing
-file instead of generating one. `--compare` keeps the last store from each
+file instead of generating one. `--workers N` sets the process count for
+both converters (`1` forces acgt's serial path); without it each tool runs
+with its own default, which is parallel for acgt on an indexed file above
+a few megabytes and serial for bio2zarr. `--compare` keeps the last store from each
 converter and checks them array for array — the same equality rule the
 oracle tests use — and adds a "same data" column; when the stores differ,
 each differing array is listed below the table. Both converters use the same variants chunk

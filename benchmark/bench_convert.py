@@ -50,24 +50,38 @@ DEFAULT_SIZES = (10_000, 100_000, 1_000_000)
 # child process: one conversion, result on stdout as JSON
 # --------------------------------------------------------------------------
 def _peak_rss_mb():
-    rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-    # ru_maxrss is bytes on macOS and kilobytes on Linux.
+    # The converter plus its largest worker process, when it used any:
+    # RUSAGE_CHILDREN reports the biggest child that has exited, and every
+    # pool worker has by the time the conversion returns. ru_maxrss is bytes
+    # on macOS and kilobytes on Linux.
+    rss = (
+        resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        + resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss
+    )
     return rss / 2**20 if platform.system() == "Darwin" else rss / 2**10
 
 
-def _run_acgt(src, out, chunk):
+def _run_acgt(src, out, chunk, workers):
     from acgt import convert
 
     t0 = time.perf_counter()
-    convert.from_vcf(src, out, chunk_size=chunk, overwrite=True)
+    convert.from_vcf(src, out, chunk_size=chunk, overwrite=True, workers=workers)
     return time.perf_counter() - t0
 
 
-def _run_bio2zarr(src, out, chunk):
+def _run_bio2zarr(src, out, chunk, workers):
     import bio2zarr.vcf as b2z
 
     t0 = time.perf_counter()
-    b2z.convert([str(src)], str(out), variants_chunk_size=chunk, show_progress=False)
+    b2z.convert(
+        [str(src)],
+        str(out),
+        variants_chunk_size=chunk,
+        show_progress=False,
+        # 0 is bio2zarr's in-process serial mode; None here means "acgt's
+        # default", which for bio2zarr is left at its own default too
+        worker_processes=0 if workers == 1 else (workers or 0),
+    )
     return time.perf_counter() - t0
 
 
@@ -86,8 +100,8 @@ def _dir_size_mb(path):
     return sum(p.stat().st_size for p in Path(path).rglob("*") if p.is_file()) / 2**20
 
 
-def worker(tool, src, out, chunk):
-    seconds = RUNNERS[tool](src, out, chunk)
+def worker(tool, src, out, chunk, workers):
+    seconds = RUNNERS[tool](src, out, chunk, workers)
     problems, n = _check(out)
     print(
         json.dumps(
@@ -106,10 +120,19 @@ def worker(tool, src, out, chunk):
 # --------------------------------------------------------------------------
 # parent process: generate, fan out, collect, report
 # --------------------------------------------------------------------------
-def measure(tool, src, workdir, chunk, keep=False):
+def measure(tool, src, workdir, chunk, workers, keep=False):
     out = Path(workdir) / f"{tool}.vcz"
     proc = subprocess.run(
-        [sys.executable, __file__, "--_worker", tool, str(src), str(out), str(chunk)],
+        [
+            sys.executable,
+            __file__,
+            "--_worker",
+            tool,
+            str(src),
+            str(out),
+            str(chunk),
+            str(workers or 0),
+        ],
         capture_output=True,
         text=True,
         check=False,
@@ -177,7 +200,7 @@ def compare_stores(ours, theirs):
     return diffs
 
 
-def bench_file(src, tools, workdir, chunk, repeat, compare=False):
+def bench_file(src, tools, workdir, chunk, repeat, workers, *, compare=False):
     """Best-of-`repeat` per tool for one input file. Returns a table row."""
     row = {"file": src.name, "input_mb": src.stat().st_size / 2**20}
     for tool in tools:
@@ -185,7 +208,7 @@ def bench_file(src, tools, workdir, chunk, repeat, compare=False):
         for i in range(repeat):
             print(f"  {tool} run {i + 1}/{repeat} ...", file=sys.stderr)
             keep = compare and i == repeat - 1
-            runs.append(measure(tool, src, workdir, chunk, keep=keep))
+            runs.append(measure(tool, src, workdir, chunk, workers, keep=keep))
         best = min(runs, key=lambda r: r["seconds"])
         row[tool] = {
             "seconds": best["seconds"],
@@ -242,10 +265,10 @@ def _cells(row, tools, compare):
     return cells
 
 
-def report(rows, tools, chunk, repeat, markdown, compare):
+def report(rows, tools, chunk, repeat, markdown, compare, workers):
     print(
         f"\n{platform.platform()}  Python {platform.python_version()}  "
-        f"chunk={chunk}  best-of-{repeat}"
+        f"chunk={chunk}  best-of-{repeat}  workers={workers or 'default'}"
     )
     if len(tools) > 1:
         print(f"speedup = {tools[0]} time relative to {', '.join(tools[1:])}")
@@ -291,8 +314,8 @@ def _sizes(text):
 
 def main(argv=None):
     if argv is None and len(sys.argv) > 1 and sys.argv[1] == "--_worker":
-        tool, src, out, chunk = sys.argv[2:6]
-        worker(tool, src, out, int(chunk))
+        tool, src, out, chunk, workers = sys.argv[2:7]
+        worker(tool, src, out, int(chunk), int(workers) or None)
         return
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument(
@@ -309,6 +332,12 @@ def main(argv=None):
     )
     parser.add_argument("--repeat", type=int, default=1, help="runs per converter")
     parser.add_argument("--chunk-size", type=int, default=CHUNK)
+    parser.add_argument(
+        "--workers",
+        type=int,
+        help="process count for both converters; 1 forces acgt's serial path "
+        "(default: each tool's own default -- acgt parallel, bio2zarr serial)",
+    )
     parser.add_argument("--seed", type=int, default=20260815)
     parser.add_argument("--no-bio2zarr", action="store_true", help="time acgt only")
     parser.add_argument(
@@ -342,7 +371,13 @@ def main(argv=None):
             print(f"{args.vcf.name}", file=sys.stderr)
             rows.append(
                 bench_file(
-                    args.vcf, tools, tmp, args.chunk_size, args.repeat, args.compare
+                    args.vcf,
+                    tools,
+                    tmp,
+                    args.chunk_size,
+                    args.repeat,
+                    args.workers,
+                    compare=args.compare,
                 )
             )
         else:
@@ -354,12 +389,26 @@ def main(argv=None):
                 vcf = make_genome.compress(vcf)
                 rows.append(
                     bench_file(
-                        vcf, tools, tmp, args.chunk_size, args.repeat, args.compare
+                        vcf,
+                        tools,
+                        tmp,
+                        args.chunk_size,
+                        args.repeat,
+                        args.workers,
+                        compare=args.compare,
                     )
                 )
                 for leftover in Path(tmp).glob(f"synthetic_{n}.vcf*"):
                     leftover.unlink()
-    report(rows, tools, args.chunk_size, args.repeat, args.markdown, args.compare)
+    report(
+        rows,
+        tools,
+        args.chunk_size,
+        args.repeat,
+        args.markdown,
+        args.compare,
+        args.workers,
+    )
 
 
 if __name__ == "__main__":
