@@ -570,49 +570,164 @@ _HTS_MAX_POS = 2**31 - 1
 def _index_file(path):
     """The index the parallel path may seek with, or None.
 
-    An index older than the data file is treated as absent: it describes an
-    earlier version of the file, and windows read through it would silently
-    skip whatever was written since -- both passes would use the same stale
-    index, so the record counts would agree and the fill-pass check would
-    not notice. htslib only warns in this situation; here it means the
-    serial path, which reads every record regardless of any index.
+    Only an index that demonstrably describes the current file is used:
+    windows read through an index left over from an earlier version of the
+    file see the records it points at and silently miss the rest -- both
+    passes use the same index, so their counts agree and the fill-pass check
+    cannot notice. Each candidate goes through _index_mismatch; a rejected
+    one is logged and the next suffix tried, so a stale .tbi does not hide a
+    good .csi. Nothing usable means the serial path, which reads every
+    record regardless of any index.
     """
-    data_mtime = Path(path).stat().st_mtime_ns
+    path = Path(path)
     for suffix in (".tbi", ".csi"):
         candidate = Path(f"{path}{suffix}")
         if not candidate.exists():
             continue
-        if candidate.stat().st_mtime_ns < data_mtime:
-            log.warning(
-                "%s is older than %s; ignoring the index and converting "
-                "serially -- rebuild it (tabix/bcftools index) to convert in parallel",
-                candidate.name,
-                Path(path).name,
-            )
-            return None
-        return candidate
+        why = _index_mismatch(path, candidate)
+        if why is None:
+            return candidate
+        log.warning(
+            "ignoring %s: %s -- rebuild it (tabix/bcftools index) to convert "
+            "in parallel",
+            candidate.name,
+            why,
+        )
     return None
+
+
+def _index_mismatch(data, index):
+    """Why `index` cannot be trusted to describe `data`, or None if it can.
+
+    Two tests. Modification time is the cheap one: an index older than its
+    data file was built for something else. It is not identity, though -- a
+    copied index is newer than the file it does not describe -- so the index
+    is also checked against the file's content. Every chunk in a tabix or
+    CSI index ends at a BGZF virtual offset, and the largest of them is
+    where the last indexed record ends; in the file the index describes,
+    nothing but empty blocks follows that point. If the offset is not a
+    block boundary in this file, or uncompressed data remains after it, the
+    file has changed since the index was built. This catches appended,
+    truncated, and re-compressed files; it cannot tell apart two files of
+    identical block layout that differ only in content, which no check
+    short of re-reading the file can.
+    """
+    if index.stat().st_mtime_ns < data.stat().st_mtime_ns:
+        return f"it is older than {data.name}"
+    try:
+        _, end = _read_index(index)
+    except (OSError, EOFError, struct.error) as e:
+        return f"it does not parse ({e})"
+    if end is None:
+        return "it is not a tabix or CSI index"
+    coff, uoff = end >> 16, end & 0xFFFF
+    with data.open("rb") as fh:
+        size = fh.seek(0, os.SEEK_END)
+        if coff >= size:
+            return f"it points past the end of {data.name}"
+        block = _bgzf_block(fh, coff)
+        if block is None or uoff > block[1]:
+            return f"its last record offset is not a block boundary in {data.name}"
+        pos, trailing = coff + block[0], block[1] - uoff
+        while pos < size and not trailing:
+            block = _bgzf_block(fh, pos)
+            if block is None:
+                return f"{data.name} is not BGZF after the last indexed record"
+            pos, trailing = pos + block[0], block[1]
+    if trailing:
+        return f"{data.name} has data after the last record it indexes"
+    return None
+
+
+def _bgzf_block(fh, offset):
+    """(compressed size, uncompressed size) of the BGZF block at `offset`,
+    or None when no valid block header starts there."""
+    fh.seek(offset)
+    header = fh.read(12)
+    if len(header) < 12 or header[:4] != b"\x1f\x8b\x08\x04":
+        return None
+    (xlen,) = struct.unpack("<H", header[10:12])
+    extra = fh.read(xlen)
+    if len(extra) < xlen:
+        return None
+    i, bsize = 0, None
+    while i + 4 <= xlen:
+        si1, si2, slen = (
+            extra[i],
+            extra[i + 1],
+            struct.unpack("<H", extra[i + 2 : i + 4])[0],
+        )
+        if si1 == 66 and si2 == 67 and slen == 2:
+            (bsize,) = struct.unpack("<H", extra[i + 4 : i + 6])
+            break
+        i += 4 + slen
+    if bsize is None:
+        return None
+    total = bsize + 1
+    fh.seek(offset + total - 4)
+    tail = fh.read(4)
+    if len(tail) < 4:
+        return None
+    (isize,) = struct.unpack("<I", tail)
+    return total, isize
+
+
+def _read_index(index):
+    """(contig names or None, largest chunk end offset or None) from a
+    tabix or CSI index; (None, None) for anything else.
+
+    tabix writes contig names into both .tbi and .csi; bcftools' CSI for a
+    BCF does not, since BCF records name contigs by header position and
+    cannot mention an undeclared one. The pseudo-bin htslib may add per
+    contig holds counts, not offsets, and is skipped.
+    """
+    with gzip.open(index, "rb") as fh:
+        read = fh.read
+
+        def ints(n):
+            return struct.unpack(f"<{n}i", read(4 * n))
+
+        magic = read(4)
+        if magic == b"TBI\1":
+            (n_ref, *_) = ints(
+                7
+            )  # n_ref, format, col_seq, col_beg, col_end, meta, skip
+            (l_nm,) = ints(1)
+            names = [x.decode() for x in read(l_nm).split(b"\0") if x]
+            depth, csi = 5, False
+        elif magic == b"CSI\1":
+            _, depth, l_aux = ints(3)
+            aux = read(l_aux)
+            names = None
+            if l_aux >= 4 * 7:
+                (l_nm,) = struct.unpack("<i", aux[24:28])
+                names = [x.decode() for x in aux[28 : 28 + l_nm].split(b"\0") if x]
+            (n_ref,) = ints(1)
+            csi = True
+        else:
+            return None, None
+        meta_bin = ((1 << (3 * depth + 3)) - 1) // 7 + 1
+        end = 0
+        for _ in range(n_ref):
+            (n_bin,) = ints(1)
+            for _ in range(n_bin):
+                (bin_id,) = struct.unpack("<I", read(4))
+                if csi:
+                    read(8)  # loff
+                (n_chunk,) = ints(1)
+                chunks = struct.unpack(f"<{2 * n_chunk}Q", read(16 * n_chunk))
+                if bin_id != meta_bin:
+                    end = max(end, *chunks[1::2], 0)
+            if not csi:
+                (n_intv,) = ints(1)
+                read(8 * n_intv)
+        return names, end
 
 
 def _index_contigs(index):
     """The contig names an index carries, in the order they occur in the
-    file, or None when it carries none. tabix writes them into both .tbi and
-    .csi; bcftools' CSI for a BCF does not, since BCF records name contigs by
-    header position and cannot mention an undeclared one."""
-    with gzip.open(index, "rb") as fh:
-        magic = fh.read(4)
-        if magic == b"TBI\1":
-            fh.read(4 * 7)  # n_ref, format, col_seq, col_beg, col_end, meta, skip
-        elif magic == b"CSI\1":
-            fh.read(4 * 2)  # min_shift, depth
-            (l_aux,) = struct.unpack("<i", fh.read(4))
-            if l_aux < 4 * 7:
-                return None
-            fh.read(4 * 6)  # format, col_seq, col_beg, col_end, meta, skip
-        else:
-            return None
-        (l_nm,) = struct.unpack("<i", fh.read(4))
-        return [name.decode() for name in fh.read(l_nm).split(b"\0") if name]
+    file, or None when it carries none."""
+    return _read_index(index)[0]
 
 
 def _partitions(contigs, lengths, window=None):
@@ -753,7 +868,7 @@ def _fill_partition(job):
 def _plan_parallel(path, workers, contigs, contig_lengths):
     """Partitions for the parallel path, or None when the serial path should
     run: one worker asked for, no usable index to seek with (none, or one
-    older than the data), or -- with `workers` left to default -- a file
+    that fails _index_mismatch), or -- with `workers` left to default -- a file
     small enough that process start-up would outweigh the gain. An explicit
     `workers` forces the parallel path when an index allows it."""
     if workers == 1:
@@ -822,8 +937,8 @@ def from_vcf(
     long conversion cannot fail at the very end on it.
 
     Both passes run in parallel over genomic windows when the file has a
-    tabix or CSI index that is at least as new as the file itself and is
-    large enough for that to pay off; `workers`
+    tabix or CSI index that checks out as describing this file (see
+    _index_mismatch) and is large enough for that to pay off; `workers`
     sets the process count (default: up to 8, one per core), 1 forces the
     serial path, and any other explicit value forces the parallel one. The
     output is the same either way for a sorted file; see _plan_parallel for

@@ -486,18 +486,14 @@ def test_ids_longer_than_the_cap_survive(mini_vcf, tmp_path):
     assert_stores_equal(ours, oracle_store(vcf, tmp_path / "theirs.vcz"))
 
 
-def test_stale_index_is_ignored_and_the_file_converts_serially(
-    sample_vcf, tmp_path, caplog
-):
-    """An index older than its data file describes an earlier version of the
-    file; seeking through it would silently drop records on the parallel
-    path, so it must count as no index at all."""
+def test_index_older_than_the_data_is_ignored(sample_vcf, tmp_path, caplog):
+    """Modification time is the cheap first test: an index older than its
+    data file was built for something else."""
     src = tmp_path / "sample.vcf.gz"
     index = tmp_path / "sample.vcf.gz.tbi"
     shutil.copy(sample_vcf, src)
     shutil.copy(f"{sample_vcf}.tbi", index)
     assert convert._index_file(src) == index
-    # data file "modified" after the index was built
     newer = index.stat().st_mtime_ns + 5_000_000_000
     os.utime(src, ns=(newer, newer))
     with caplog.at_level(logging.WARNING, logger="acgt.convert"):
@@ -506,6 +502,96 @@ def test_stale_index_is_ignored_and_the_file_converts_serially(
     assert any("older than" in r.message for r in caplog.records)
     ours = convert.from_vcf(src, tmp_path / "ours.vcz", chunk_size=CHUNK, workers=2)
     assert_stores_equal(ours, oracle_store(src, tmp_path / "oracle.vcz"))
-    # a rebuilt (fresh) index makes it usable again
-    os.utime(index, ns=(newer, newer))
+    os.utime(index, ns=(newer, newer))  # rebuilt: usable again
     assert convert._index_file(src) == index
+
+
+def _bgzipped_records(mini_vcf, path, n, start=100):
+    """A bgzipped single-contig VCF with `n` SNP records at spaced positions,
+    reusing the mini fixture's header. Needs bgzip on PATH."""
+    if shutil.which("bgzip") is None or shutil.which("tabix") is None:
+        pytest.skip("bgzip/tabix not installed")
+    header = [line for line in mini_vcf.read_text().splitlines(True) if line[0] == "#"]
+    plain = path.with_suffix("")
+    with plain.open("w") as fh:
+        fh.writelines(header)
+        for i in range(n):
+            fh.write(
+                f"chr1\t{start + 10 * i}\trs{i}\tA\tG\t50\tPASS\tDP=10\tGT:DP\t0/1:10\n"
+            )
+    subprocess.run(["bgzip", "-f", plain], check=True)
+    return path
+
+
+def _date_newer_than(index, data):
+    later = data.stat().st_mtime_ns + 5_000_000_000
+    os.utime(index, ns=(later, later))
+
+
+def test_index_for_another_version_of_the_file_is_ignored(mini_vcf, tmp_path, caplog):
+    """The real hazard: an index whose timestamp says nothing is wrong but
+    whose content describes an earlier version of the file. Its last-record
+    offset does not land on a block boundary of the new file, so it is
+    refused and every record comes through the serial path."""
+    src = tmp_path / "x.vcf.gz"
+    index = tmp_path / "x.vcf.gz.tbi"
+    _bgzipped_records(mini_vcf, src, 100)
+    subprocess.run(["tabix", "-p", "vcf", src], check=True)
+    old_index = index.read_bytes()
+    _bgzipped_records(mini_vcf, src, 101)  # rewritten with one more record
+    index.write_bytes(old_index)
+    _date_newer_than(index, src)
+    with caplog.at_level(logging.WARNING, logger="acgt.convert"):
+        assert convert._index_file(src) is None
+    assert any("not a block boundary" in r.message for r in caplog.records)
+    serial = convert.from_vcf(src, tmp_path / "s.vcz", chunk_size=CHUNK, workers=1)
+    parallel = convert.from_vcf(src, tmp_path / "p.vcz", chunk_size=CHUNK, workers=2)
+    assert store_arrays(parallel)["variant_position"].shape == (101,)
+    assert_stores_equal(parallel, serial)
+    # rebuilt for the current file, the index is accepted and used
+    subprocess.run(["tabix", "-f", "-p", "vcf", src], check=True)
+    assert convert._index_file(src) == index
+    parallel2 = convert.from_vcf(src, tmp_path / "p2.vcz", chunk_size=CHUNK, workers=2)
+    assert_stores_equal(parallel2, serial)
+
+
+def test_index_that_stops_before_the_end_of_the_file_is_ignored(
+    mini_vcf, tmp_path, caplog
+):
+    """Records appended after indexing (BGZF files concatenate) leave data
+    past the last indexed record; the check sees it and refuses."""
+    src = tmp_path / "x.vcf.gz"
+    index = tmp_path / "x.vcf.gz.tbi"
+    _bgzipped_records(mini_vcf, src, 100)
+    subprocess.run(["tabix", "-p", "vcf", src], check=True)
+    # five header-less records, bgzipped on their own and appended whole
+    tail = tmp_path / "tail.vcf"
+    tail.write_text(
+        "".join(
+            f"chr1\t{5000 + 10 * i}\trsx{i}\tA\tG\t50\tPASS\tDP=10\tGT:DP\t0/1:10\n"
+            for i in range(5)
+        )
+    )
+    subprocess.run(["bgzip", "-f", tail], check=True)
+    with src.open("ab") as fh:
+        fh.write((tmp_path / "tail.vcf.gz").read_bytes())
+    _date_newer_than(index, src)
+    with caplog.at_level(logging.WARNING, logger="acgt.convert"):
+        assert convert._index_file(src) is None
+    assert any("has data after" in r.message for r in caplog.records)
+    parallel = convert.from_vcf(src, tmp_path / "p.vcz", chunk_size=CHUNK, workers=2)
+    assert store_arrays(parallel)["variant_position"].shape == (105,)
+
+
+def test_stale_tbi_does_not_hide_a_good_csi(mini_vcf, tmp_path):
+    src = tmp_path / "x.vcf.gz"
+    _bgzipped_records(mini_vcf, src, 100)
+    subprocess.run(["tabix", "-p", "vcf", src], check=True)
+    old_tbi = (tmp_path / "x.vcf.gz.tbi").read_bytes()
+    _bgzipped_records(mini_vcf, src, 101)
+    subprocess.run(["tabix", "-C", "-p", "vcf", src], check=True)  # good .csi
+    (tmp_path / "x.vcf.gz.tbi").write_bytes(old_tbi)  # stale .tbi
+    _date_newer_than(tmp_path / "x.vcf.gz.tbi", src)
+    assert convert._index_file(src) == tmp_path / "x.vcf.gz.csi"
+    parallel = convert.from_vcf(src, tmp_path / "p.vcz", chunk_size=CHUNK, workers=2)
+    assert store_arrays(parallel)["variant_position"].shape == (101,)
