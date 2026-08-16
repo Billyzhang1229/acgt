@@ -469,3 +469,17 @@ def test_fill_refuses_a_count_that_disagrees_with_the_scan(sample_vcf):
     finally:
         convert._worker.clear()
         shared.close()
+
+
+def test_ids_longer_than_the_cap_survive(mini_vcf, tmp_path):
+    """A legal VCF ID longer than the inline string cap goes through the
+    spill path; it must come back whole and match the oracle."""
+    long_id = "rs" + "0123456789" * 6  # 62 chars, past DEFAULT_STRING_CAP
+    text = mini_vcf.read_text().replace("\trs2\t", f"\t{long_id}\t")
+    vcf = tmp_path / "long_id.vcf"
+    vcf.write_text(text)
+    assert len(long_id) > convert.DEFAULT_STRING_CAP
+    ours = convert.from_vcf(vcf, tmp_path / "ours.vcz", chunk_size=CHUNK)
+    ds = dataset.open_dataset(ours)
+    assert str(ds["variant_id"].values[1]) == long_id
+    assert_stores_equal(ours, oracle_store(vcf, tmp_path / "theirs.vcz"))

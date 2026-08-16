@@ -251,12 +251,9 @@ def test_failed_save_never_touches_the_target(tmp_path):
 def test_failed_write_cleans_up_the_partial_directory(tmp_path):
     arrays, schema, _ = tiny()
     # a field lying about its rank makes array creation itself fail
-    bad = core.ArraySpec(
-        "variant_position", core.KIND_INT, (core.DIM_VARIANTS, "extra_dim")
-    )
-    schema.fields = tuple(
-        bad if f.name == "variant_position" else f for f in schema.fields
-    )
+    arrays["variant_XX"] = np.zeros(5, "i4")
+    bad = core.ArraySpec("variant_XX", core.KIND_INT, (core.DIM_VARIANTS, "extra_dim"))
+    schema.fields = (*schema.fields, bad)
     schema.dims = {**schema.dims, "extra_dim": 1}
     with pytest.raises(ValueError, match="dimension_names"):
         dataset.save(arrays, schema, tmp_path / "t.vcz", zarr_format=3)
@@ -415,3 +412,88 @@ def test_target_appearing_mid_write_is_refused(tmp_path, monkeypatch):
         dataset.save(arrays, schema, out, spill=spill)
     assert (out / "theirs.txt").read_text() == "someone else"
     assert not list(tmp_path.glob(".t.vcz.partial-*"))
+
+
+def test_failed_rollback_keeps_the_old_store(tmp_path, monkeypatch):
+    """When the new store cannot be put in place and the old one cannot be
+    put back either, the old store must survive somewhere and the error must
+    say where; deleting the holding directory would lose it."""
+    arrays, schema, spill = tiny()
+    out = dataset.save(arrays, schema, tmp_path / "t.vcz", spill=spill)
+    real = os.replace
+
+    def always_fail_into_out(src, dst):
+        if Path(dst) == out:
+            raise OSError(f"simulated crash moving {Path(src).name}")
+        return real(src, dst)
+
+    monkeypatch.setattr(dataset.os, "replace", always_fail_into_out)
+    with pytest.raises(OSError, match="preserved at") as info:
+        dataset.save(arrays, schema, out, spill=spill, overwrite=True)
+    monkeypatch.undo()
+    assert not out.exists()
+    backup = Path(str(info.value).rsplit("preserved at ", 1)[1])
+    assert backup.name == "old"
+    assert ".replaced-" in backup.parent.name
+    assert dataset.preflight(backup) == []
+    assert not list(tmp_path.glob(".t.vcz.partial-*"))
+
+
+def test_string_inputs_may_be_unicode_and_land_as_variable_length(tmp_path):
+    def unicode_ids(arrays, schema):
+        arrays["variant_id"] = arrays["variant_id"].astype("U4")
+        arrays["variant_allele"] = arrays["variant_allele"].astype("U3")
+
+    out = saved(tmp_path, 2, mutate=unicode_ids)
+    assert dataset.preflight(out) == []
+    root = zarr.open_group(out, mode="r")
+    assert dataset._array(root, "variant_id").dtype.kind != "U"
+    ds = dataset.open_dataset(out)
+    assert ds["variant_id"].values.tolist() == [".", "rs2", ".", ".", "rs4242424242"]
+
+
+def test_preflight_rejects_fixed_width_unicode_for_strings(tmp_path):
+    out = saved(tmp_path, 2)
+    corrupt(out, lambda root: rechunk(root, "sample_id", (1,), dtype="U2"))
+    assert any("sample_id: dtype" in p for p in dataset.preflight(out))
+
+
+def test_stored_schema_cannot_redefine_a_fixed_array(tmp_path):
+    bent = core.ArraySpec("variant_position", core.KIND_INT, ("not_variants",))
+    with pytest.raises(ValueError, match="fixed by the spec"):
+        core.Schema(dims={"not_variants": 5}, fields=(bent,))
+    # a store whose stored schema was tampered with is reported, not trusted
+    out = saved(tmp_path, 2)
+
+    def bend_schema(root):
+        raw = dict(root.attrs[core.SCHEMA_ATTR])
+        raw["dims"] = {**raw["dims"], "not_variants": 5}
+        raw["fields"] = [
+            {**f, "dims": ["not_variants"]} if f["name"] == "variant_position" else f
+            for f in raw["fields"]
+        ]
+        root.attrs[core.SCHEMA_ATTR] = raw
+
+    corrupt(out, bend_schema)
+    problems = dataset.preflight(out)
+    assert any("does not parse" in p and "variant_position" in p for p in problems)
+
+
+def test_unknown_schema_kind_is_a_problem_not_a_crash(tmp_path):
+    with pytest.raises(ValueError, match="unknown kind"):
+        core.ArraySpec("variant_X", "bogus", (core.DIM_VARIANTS,))
+    out = saved(tmp_path, 2)
+
+    def bogus_kind(root):
+        raw = dict(root.attrs[core.SCHEMA_ATTR])
+        raw["fields"] = [
+            {**f, "kind": "bogus"} if f["name"] == "variant_id" else f
+            for f in raw["fields"]
+        ]
+        root.attrs[core.SCHEMA_ATTR] = raw
+
+    corrupt(out, bogus_kind)
+    problems = dataset.preflight(out)
+    assert any("bogus" in p for p in problems)
+    # and the guard inside preflight holds even if a spec slips through
+    assert dataset._KIND_ACCEPTS.get("bogus") is None

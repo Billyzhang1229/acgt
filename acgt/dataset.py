@@ -234,6 +234,9 @@ def _publish(tmp, out, overwrite):
     Re-checks `overwrite`, since the first check ran before a possibly long
     write. Replacement is rename-aside then rename-in with rollback, so a
     failure at any point leaves either the old or the new store at `out`.
+    The set-aside copy is deleted only once one of the two is in place; if
+    the rollback itself fails the old store stays where it was moved and the
+    error says where.
     """
     if not out.exists():
         os.replace(tmp, out)
@@ -247,11 +250,18 @@ def _publish(tmp, out, overwrite):
     os.replace(out, backup)
     try:
         os.replace(tmp, out)
-    except BaseException:
-        os.replace(backup, out)
-        raise
-    finally:
+    except BaseException as publish_error:
+        try:
+            os.replace(backup, out)
+        except OSError as rollback_error:
+            raise OSError(
+                f"could not put the new store at {out} ({publish_error}), and "
+                f"could not put the old one back either ({rollback_error}); "
+                f"the old store is preserved at {backup}"
+            ) from publish_error
         shutil.rmtree(holding, ignore_errors=True)
+        raise
+    shutil.rmtree(holding, ignore_errors=True)
 
 
 def _write_store(
@@ -279,9 +289,10 @@ def _write_store(
     for name, a in arrays.items():
         spec = specs.get(name) or core.FIXED_ARRAYS[name]
         dims = list(spec.dims)
-        is_str = a.dtype.kind == "S"
-        # VCF Character is a fixed-width U1 on disk, per the spec and the
-        # reference; everything else textual is a variable-length string
+        # fixed-width bytes and fixed-width unicode are both text on the way
+        # in; VCF Character is a fixed-width U1 on disk, per the spec and the
+        # reference, and everything else textual is a variable-length string
+        is_str = a.dtype.kind in "SU"
         is_char = is_str and spec.kind == core.KIND_CHAR
         src = a
         if not is_str and a.dtype.kind == "i":
@@ -321,13 +332,19 @@ def _write_store(
             return
         block = a[c0:c1]
         if is_char:
-            z[c0:c1] = np.char.decode(block, "utf-8").astype("U1")
+            if block.dtype.kind == "S":
+                block = np.char.decode(block, "utf-8")
+            z[c0:c1] = block.astype("U1")
             return
-        # tolist() + bytes.decode goes straight to object dtype; np.char.decode
-        # materialises a U-dtype copy (4 bytes/char) and is far slower.
-        flat = np.empty(block.size, dtype=object)
-        flat[:] = [x.decode("utf-8") for x in block.reshape(-1).tolist()]
-        out_block = flat.reshape(block.shape)
+        if block.dtype.kind == "U":
+            out_block = block.astype(object)
+        else:
+            # tolist() + bytes.decode goes straight to object dtype;
+            # np.char.decode materialises a U-dtype copy (4 bytes/char)
+            # and is far slower.
+            flat = np.empty(block.size, dtype=object)
+            flat[:] = [x.decode("utf-8") for x in block.reshape(-1).tolist()]
+            out_block = flat.reshape(block.shape)
         for idx, value in patches.items():
             if c0 <= idx[0] < c1:
                 out_block[(idx[0] - c0, *idx[1:])] = value
@@ -351,10 +368,11 @@ _KIND_ACCEPTS = {
     core.KIND_INT: "i",
     core.KIND_FLOAT: "f",
     core.KIND_BOOL: "b",
-    # the spec says |O; zarr-python 3 presents that as numpy's StringDType
-    # (kind T), and fixed-width unicode is the same text. Raw bytes are not
-    # text and no writer of this spec version produces them.
-    core.KIND_STR: "OTU",
+    # the spec says |O, variable length; zarr-python 3 presents that as
+    # numpy's StringDType (kind T). Fixed-width unicode is not accepted here:
+    # the spec reserves U (as U1) for Character, and a U-typed String array
+    # silently truncates any value longer than its width.
+    core.KIND_STR: "OT",
     core.KIND_CHAR: "U",  # exactly U1 -- the width is checked separately
 }
 _CHAR_ITEMSIZE = np.dtype("U1").itemsize
@@ -386,8 +404,11 @@ def preflight(path, *, deep=False) -> list[str]:
         f"missing mandatory array {k}" for k in sorted(core.REQUIRED_ARRAYS - keys)
     )
 
-    # what each array should look like: the stored schema where one exists,
-    # the spec's fixed arrays otherwise
+    # what each array should look like: the spec's fixed arrays always, the
+    # stored schema for everything else. Schema.fromdict rejects a schema
+    # that redefines a fixed array or names an unknown kind, so a schema
+    # that parses cannot conflict with FIXED_ARRAYS; the merge order below
+    # is a second guard for the same rule.
     schema = None
     raw = z.attrs.get(core.SCHEMA_ATTR)
     if raw is not None:
@@ -398,7 +419,7 @@ def preflight(path, *, deep=False) -> list[str]:
     specs = dict(core.FIXED_ARRAYS)
     declared_sizes = {}
     if schema is not None:
-        specs.update(schema.field_map())
+        specs = {**schema.field_map(), **core.FIXED_ARRAYS}
         declared_sizes = dict(schema.dims)
         problems.extend(
             f"schema lists {f.name} but the store lacks it"
@@ -426,7 +447,10 @@ def preflight(path, *, deep=False) -> list[str]:
                 problems.append(
                     f"{k}: dimensions {d} do not match the schema's {list(spec.dims)}"
                 )
-            if array.dtype.kind not in _KIND_ACCEPTS[spec.kind]:
+            accepts = _KIND_ACCEPTS.get(spec.kind)
+            if accepts is None:
+                problems.append(f"{k}: schema kind {spec.kind!r} is not known")
+            elif array.dtype.kind not in accepts:
                 problems.append(f"{k}: dtype {array.dtype} is not {spec.kind}")
             elif spec.kind == core.KIND_CHAR and array.dtype.itemsize != _CHAR_ITEMSIZE:
                 problems.append(f"{k}: dtype {array.dtype} is not the spec's U1")

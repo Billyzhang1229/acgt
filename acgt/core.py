@@ -128,6 +128,13 @@ class ArraySpec:
     dims: tuple[str, ...]
     description: str = ""
 
+    def __post_init__(self):
+        if self.kind not in KINDS:
+            raise ValueError(
+                f"array {self.name!r} has unknown kind {self.kind!r}; "
+                f"expected one of {sorted(KINDS)}"
+            )
+
 
 # The arrays defined by the spec itself, as opposed to those derived from a
 # VCF header. Keyed by array name; values follow VCF Zarr 0.5.
@@ -308,6 +315,18 @@ class Schema:
                         f"field {field.name!r} uses dimension {dim!r}, "
                         "which dims does not declare"
                     )
+            # the spec fixes the kind and dimensions of these arrays; a
+            # schema may describe them but not redefine them
+            fixed = FIXED_ARRAYS.get(field.name)
+            if fixed is not None and (field.kind, field.dims) != (
+                fixed.kind,
+                fixed.dims,
+            ):
+                raise ValueError(
+                    f"field {field.name!r} is fixed by the spec as "
+                    f"{fixed.kind} over {list(fixed.dims)}, but the schema "
+                    f"says {field.kind} over {list(field.dims)}"
+                )
 
     def asdict(self) -> dict:
         return dataclasses.asdict(self)

@@ -320,7 +320,8 @@ def _fill(
     The per-field work is flattened into (array, kind, ...) tuples so the
     record loop does no attribute lookups; strings longer than the inline
     cap go to the spill dict instead of widening every row. Returns the
-    number of records written and the spill dict, keyed by absolute index.
+    number of records written and the spill dict, keyed by (array name,
+    absolute index tuple) as dataset.save expects.
     """
     INFO_FLAG, INFO_SCALAR, INFO_VECTOR, FMT_SCALAR, FMT_VECTOR = range(5)
     ops = []
@@ -367,7 +368,8 @@ def _fill(
             ) from None
         q = v.QUAL
         qual[i] = core.FLOAT32_MISSING if q is None else q
-        put_str(vid, "variant_id", i, v.ID or core.STR_MISSING)
+        # index tuples throughout: the writer patches spill by idx[0]
+        put_str(vid, "variant_id", (i,), v.ID or core.STR_MISSING)
         put_str(allele, "variant_allele", (i, 0), v.REF)
         k = 1
         for a in v.ALT:
