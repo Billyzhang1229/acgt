@@ -21,6 +21,7 @@ import pytest
 import vcztools
 import zarr
 from bio2zarr import vcz_verification
+from cyvcf2 import VCF
 
 from acgt import convert, core, dataset
 
@@ -595,3 +596,79 @@ def test_stale_tbi_does_not_hide_a_good_csi(mini_vcf, tmp_path):
     assert convert._index_file(src) == tmp_path / "x.vcf.gz.csi"
     parallel = convert.from_vcf(src, tmp_path / "p.vcz", chunk_size=CHUNK, workers=2)
     assert store_arrays(parallel)["variant_position"].shape == (101,)
+
+
+def test_count_records_matches_the_parser_without_an_index(sample_vcf, sample_bcf):
+    for src in (sample_vcf, sample_bcf):
+        assert convert.count_records(src) == sum(1 for _ in VCF(src))
+
+
+TWO_CONTIG_HEADER = (
+    "##fileformat=VCFv4.2\n"
+    "##contig=<ID=chr1,length=100000>\n"
+    "##contig=<ID=chr2,length=100000>\n"
+    '##FILTER=<ID=PASS,Description="All filters passed">\n'
+    '##INFO=<ID=DP,Number=1,Type=Integer,Description="Depth">\n'
+    '##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">\n'
+    "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS1\n"
+)
+
+
+def _two_contig_file(path, first, second):
+    """Six records on `first` then five on `second`, every line the same
+    length, so swapping the contig names changes content but not layout."""
+    if shutil.which("bgzip") is None or shutil.which("tabix") is None:
+        pytest.skip("bgzip/tabix not installed")
+    plain = path.with_suffix("")
+    with plain.open("w") as fh:
+        fh.write(TWO_CONTIG_HEADER)
+        for contig, n in ((first, 6), (second, 5)):
+            for i in range(n):
+                fh.write(
+                    f"{contig}\t{1000 + 10 * i}\trs{i}\tA\tG\t50\tPASS\tDP=10\tGT\t0/1\n"
+                )
+    subprocess.run(["bgzip", "-f", plain], check=True)
+    return path
+
+
+def test_index_of_identical_layout_but_other_content_cannot_drop_records(
+    tmp_path, caplog, monkeypatch
+):
+    """The case no look at the index can catch: the file was rewritten with
+    the same block layout and length, only the contig names swapped, and the
+    old index put back and dated newer. Every offset in it is still valid,
+    so the cheap checks pass -- forced here so the test does not depend on
+    deflate happening to produce a different size -- and the windows read
+    through it miss records. The scan's total is then held to an index-free
+    count of the file, the mismatch is caught, and the conversion completes
+    serially with every record."""
+    src = tmp_path / "x.vcf.gz"
+    index = tmp_path / "x.vcf.gz.tbi"
+    _two_contig_file(src, "chr2", "chr1")
+    subprocess.run(["tabix", "-p", "vcf", src], check=True)
+    old_index = index.read_bytes()
+    _two_contig_file(src, "chr1", "chr2")  # same layout, contigs swapped
+    index.write_bytes(old_index)
+    _date_newer_than(index, src)
+    monkeypatch.setattr(convert, "_index_mismatch", lambda data, index: None)
+    assert convert._index_file(src) == index
+    serial = convert.from_vcf(src, tmp_path / "s.vcz", chunk_size=CHUNK, workers=1)
+    with caplog.at_level(logging.WARNING, logger="acgt.convert"):
+        parallel = convert.from_vcf(
+            src, tmp_path / "p.vcz", chunk_size=CHUNK, workers=2
+        )
+    assert any("describes another version" in r.message for r in caplog.records)
+    assert store_arrays(parallel)["variant_position"].shape == (11,)
+    assert_stores_equal(parallel, serial)
+    # with an index built for this file the parallel path runs as such. (The
+    # oracle is only consulted now: bio2zarr trusts the index and fails an
+    # internal assertion on the stale one.)
+    subprocess.run(["tabix", "-f", "-p", "vcf", src], check=True)
+    assert_stores_equal(parallel, oracle_store(src, tmp_path / "oracle.vcz"))
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="acgt.convert"):
+        parallel2 = convert.from_vcf(
+            src, tmp_path / "p2.vcz", chunk_size=CHUNK, workers=2
+        )
+    assert not any("another version" in r.message for r in caplog.records)
+    assert_stores_equal(parallel2, serial)

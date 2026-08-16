@@ -27,6 +27,7 @@ import concurrent.futures
 import contextlib
 import dataclasses
 import gzip
+import io
 import logging
 import math
 import multiprocessing
@@ -570,14 +571,15 @@ _HTS_MAX_POS = 2**31 - 1
 def _index_file(path):
     """The index the parallel path may seek with, or None.
 
-    Only an index that demonstrably describes the current file is used:
-    windows read through an index left over from an earlier version of the
+    Windows read through an index left over from an earlier version of the
     file see the records it points at and silently miss the rest -- both
     passes use the same index, so their counts agree and the fill-pass check
-    cannot notice. Each candidate goes through _index_mismatch; a rejected
-    one is logged and the next suffix tried, so a stale .tbi does not hide a
-    good .csi. Nothing usable means the serial path, which reads every
-    record regardless of any index.
+    cannot notice. Each candidate goes through _index_mismatch, which
+    rejects the cheaply detectable cases; a rejected one is logged and the
+    next suffix tried, so a stale .tbi does not hide a good .csi. Nothing
+    usable means the serial path, which reads every record regardless of
+    any index. What these checks cannot see, the record count taken in
+    from_vcf after the scan does; see count_records.
     """
     path = Path(path)
     for suffix in (".tbi", ".csi"):
@@ -608,9 +610,10 @@ def _index_mismatch(data, index):
     nothing but empty blocks follows that point. If the offset is not a
     block boundary in this file, or uncompressed data remains after it, the
     file has changed since the index was built. This catches appended,
-    truncated, and re-compressed files; it cannot tell apart two files of
-    identical block layout that differ only in content, which no check
-    short of re-reading the file can.
+    truncated, and re-compressed files early, before any parallel work is
+    spent. It cannot tell apart two files of identical block layout that
+    differ only in content; that case is caught after the scan by
+    count_records, which reads the file without the index.
     """
     if index.stat().st_mtime_ns < data.stat().st_mtime_ns:
         return f"it is older than {data.name}"
@@ -728,6 +731,47 @@ def _index_contigs(index):
     """The contig names an index carries, in the order they occur in the
     file, or None when it carries none."""
     return _read_index(index)[0]
+
+
+def count_records(path):
+    """The number of records in a BGZF-compressed VCF or BCF, counted
+    without any index and without parsing records.
+
+    This is what makes the parallel path safe to trust. Its windows are read
+    through the index, and no test of the index alone can prove it describes
+    this file: an index built for a file of identical block layout but
+    different content passes every offset check and still steers the
+    windows past records. Each record can be counted at most once by the
+    windows -- they are disjoint by position -- so if their total equals
+    this count, none was missed. A VCF is decompressed and its newlines
+    counted past the header; a BCF is walked record frame by record frame
+    from the lengths each carries. Decompression is the whole cost, and it
+    runs in a pool worker alongside the scan.
+    """
+    with gzip.open(path, "rb") as raw:
+        fh = io.BufferedReader(raw, 1 << 22)
+        magic = fh.peek(5)[:5]
+        if magic == b"BCF\2\2":
+            fh.read(5)
+            (l_text,) = struct.unpack("<I", fh.read(4))
+            fh.seek(l_text, os.SEEK_CUR)
+            n = 0
+            while True:
+                head = fh.read(8)
+                if len(head) < 8:
+                    return n
+                l_shared, l_indiv = struct.unpack("<II", head)
+                fh.seek(l_shared + l_indiv, os.SEEK_CUR)
+                n += 1
+        # text: skip header lines, then count line ends
+        while fh.peek(1)[:1] == b"#":
+            fh.readline()
+        n = 0
+        last = b"\n"
+        while block := fh.read(1 << 22):
+            n += block.count(b"\n")
+            last = block[-1:]
+        return n + (last != b"\n")
 
 
 def _partitions(contigs, lengths, window=None):
@@ -937,12 +981,16 @@ def from_vcf(
     long conversion cannot fail at the very end on it.
 
     Both passes run in parallel over genomic windows when the file has a
-    tabix or CSI index that checks out as describing this file (see
-    _index_mismatch) and is large enough for that to pay off; `workers`
+    tabix or CSI index and is large enough for that to pay off; `workers`
     sets the process count (default: up to 8, one per core), 1 forces the
     serial path, and any other explicit value forces the parallel one. The
     output is the same either way for a sorted file; see _plan_parallel for
-    the one BCF ordering caveat.
+    the one BCF ordering caveat. An index that does not describe the file
+    (left over from an earlier version of it, say) cannot make the parallel
+    path drop records: cheap checks reject the obvious cases up front, and
+    the scan's total is held to an index-free count of the file's records
+    before anything is written, falling back to the serial path when the
+    two disagree.
     """
     t0 = time.perf_counter()
     if Path(out).exists() and not overwrite:
@@ -991,11 +1039,30 @@ def from_vcf(
                     string_cap,
                 ),
             )
+            # the independent count runs alongside the scan; see count_records
+            total = pool.submit(count_records, path)
             per_partition = list(pool.map(_scan_partition, partitions, chunksize=4))
             stats, undeclared = _reduce_scan(per_partition)
-            _warn_undeclared(undeclared)
-            counts = [st[0] for st, _ in per_partition]
-            shared = _SharedBuffers()
+            if stats[0] != total.result():
+                # the index steered the windows past records: it was built
+                # for another version of this file. Nothing read so far can
+                # be trusted, so the serial path takes over from the top.
+                log.warning(
+                    "the index for %s reaches %d of its %d records; it "
+                    "describes another version of the file. Converting "
+                    "serially -- rebuild the index (tabix/bcftools index) "
+                    "to convert in parallel",
+                    path,
+                    stats[0],
+                    total.result(),
+                )
+                pool.shutdown()
+                pool = partitions = None
+                stats = _scan(path, fields, has_genotypes, declared)
+            else:
+                _warn_undeclared(undeclared)
+                counts = [st[0] for st, _ in per_partition]
+                shared = _SharedBuffers()
         n, max_alt, observed, slen, idlen, ploidy = stats
         n_alleles = max(2, max_alt + 1)
         # the genotypes dimension is the multiset coefficient the reference uses,
@@ -1023,7 +1090,8 @@ def from_vcf(
             has_genotypes,
             empty=shared.empty if shared is not None else _numpy_empty,
         )
-        if pool is None or shared is None:  # both set together: the serial path
+        # all three set together on the parallel path
+        if pool is None or shared is None or partitions is None:
             _, spill = _fill(
                 VCF(path),
                 0,
