@@ -568,10 +568,29 @@ _HTS_MAX_POS = 2**31 - 1
 
 
 def _index_file(path):
+    """The index the parallel path may seek with, or None.
+
+    An index older than the data file is treated as absent: it describes an
+    earlier version of the file, and windows read through it would silently
+    skip whatever was written since -- both passes would use the same stale
+    index, so the record counts would agree and the fill-pass check would
+    not notice. htslib only warns in this situation; here it means the
+    serial path, which reads every record regardless of any index.
+    """
+    data_mtime = Path(path).stat().st_mtime_ns
     for suffix in (".tbi", ".csi"):
         candidate = Path(f"{path}{suffix}")
-        if candidate.exists():
-            return candidate
+        if not candidate.exists():
+            continue
+        if candidate.stat().st_mtime_ns < data_mtime:
+            log.warning(
+                "%s is older than %s; ignoring the index and converting "
+                "serially -- rebuild it (tabix/bcftools index) to convert in parallel",
+                candidate.name,
+                Path(path).name,
+            )
+            return None
+        return candidate
     return None
 
 
@@ -733,9 +752,10 @@ def _fill_partition(job):
 
 def _plan_parallel(path, workers, contigs, contig_lengths):
     """Partitions for the parallel path, or None when the serial path should
-    run: one worker asked for, no index to seek with, or -- with `workers`
-    left to default -- a file small enough that process start-up would
-    outweigh the gain. An explicit `workers` forces the parallel path."""
+    run: one worker asked for, no usable index to seek with (none, or one
+    older than the data), or -- with `workers` left to default -- a file
+    small enough that process start-up would outweigh the gain. An explicit
+    `workers` forces the parallel path when an index allows it."""
     if workers == 1:
         return None
     index = _index_file(path)
@@ -802,7 +822,8 @@ def from_vcf(
     long conversion cannot fail at the very end on it.
 
     Both passes run in parallel over genomic windows when the file has a
-    tabix or CSI index and is large enough for that to pay off; `workers`
+    tabix or CSI index that is at least as new as the file itself and is
+    large enough for that to pay off; `workers`
     sets the process count (default: up to 8, one per core), 1 forces the
     serial path, and any other explicit value forces the parallel one. The
     output is the same either way for a sorted file; see _plan_parallel for

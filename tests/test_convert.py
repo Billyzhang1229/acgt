@@ -11,6 +11,7 @@ dependencies; the application never sees them.
 
 import io
 import logging
+import os
 import shutil
 import subprocess
 
@@ -483,3 +484,28 @@ def test_ids_longer_than_the_cap_survive(mini_vcf, tmp_path):
     ds = dataset.open_dataset(ours)
     assert str(ds["variant_id"].values[1]) == long_id
     assert_stores_equal(ours, oracle_store(vcf, tmp_path / "theirs.vcz"))
+
+
+def test_stale_index_is_ignored_and_the_file_converts_serially(
+    sample_vcf, tmp_path, caplog
+):
+    """An index older than its data file describes an earlier version of the
+    file; seeking through it would silently drop records on the parallel
+    path, so it must count as no index at all."""
+    src = tmp_path / "sample.vcf.gz"
+    index = tmp_path / "sample.vcf.gz.tbi"
+    shutil.copy(sample_vcf, src)
+    shutil.copy(f"{sample_vcf}.tbi", index)
+    assert convert._index_file(src) == index
+    # data file "modified" after the index was built
+    newer = index.stat().st_mtime_ns + 5_000_000_000
+    os.utime(src, ns=(newer, newer))
+    with caplog.at_level(logging.WARNING, logger="acgt.convert"):
+        assert convert._index_file(src) is None
+        assert convert._plan_parallel(src, 2, ["chr1"], [1000000]) is None
+    assert any("older than" in r.message for r in caplog.records)
+    ours = convert.from_vcf(src, tmp_path / "ours.vcz", chunk_size=CHUNK, workers=2)
+    assert_stores_equal(ours, oracle_store(src, tmp_path / "oracle.vcz"))
+    # a rebuilt (fresh) index makes it usable again
+    os.utime(index, ns=(newer, newer))
+    assert convert._index_file(src) == index
