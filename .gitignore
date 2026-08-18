@@ -41,3 +41,11 @@ build/
 dist/
 .pytest_cache/
 .ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# Under .github only the workflows are ours; editors and agents drop
+# instruction files there that are not part of the project.
+.github/*
+!.github/workflows/

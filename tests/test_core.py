@@ -1,10 +1,8 @@
-"""The schema in core.py agrees with the spec and with the reference tools.
+"""The contract in core.py agrees with the spec and with the reference tools.
 
 Sentinel values are compared bit for bit against vcztools, the reference
 reader; if these drift, our stores stop being readable by anything else.
 """
-
-import json
 
 import numpy as np
 import pytest
@@ -69,123 +67,6 @@ class TestFixedArrays:
         assert set(vcz_constants.RESERVED_VARIABLE_NAMES) <= set(core.FIXED_ARRAYS)
 
     def test_dims_are_reserved(self):
-        for spec in core.FIXED_ARRAYS.values():
-            for dim in spec.dims:
-                assert dim in core.RESERVED_DIMS, (spec.name, dim)
-
-    def test_kinds_are_valid(self):
-        for spec in core.FIXED_ARRAYS.values():
-            assert spec.kind in core.KINDS, spec.name
-
-    def test_names_match_keys(self):
-        for name, spec in core.FIXED_ARRAYS.items():
-            assert spec.name == name
-
-    def test_region_index_has_six_columns(self):
-        assert len(core.REGION_INDEX_COLUMNS) == 6
-
-
-class TestSpecForField:
-    def test_info_scalar(self):
-        s = core.spec_for_field("INFO", "DP", "1", "Integer")
-        assert s == core.ArraySpec("variant_DP", core.KIND_INT, ("variants",))
-
-    def test_info_per_alt(self):
-        s = core.spec_for_field("INFO", "AF", "A", "Float")
-        assert s.name == "variant_AF"
-        assert s.dims == ("variants", "alt_alleles")
-        assert s.kind == core.KIND_FLOAT
-
-    def test_format_per_allele(self):
-        s = core.spec_for_field("FORMAT", "AD", "R", "Integer")
-        assert s.name == "call_AD"
-        assert s.dims == ("variants", "samples", "alleles")
-
-    def test_format_per_genotype(self):
-        s = core.spec_for_field("FORMAT", "PL", "G", "Integer")
-        assert s.dims == ("variants", "samples", "genotypes")
-
-    def test_flag(self):
-        s = core.spec_for_field("INFO", "DB", "0", "Flag")
-        assert s.kind == core.KIND_BOOL
-        assert s.dims == ("variants",)
-
-    def test_unbounded_number_gets_field_dim(self):
-        s = core.spec_for_field("INFO", "ANN", ".", "String")
-        assert s.dims == ("variants", "INFO_ANN_dim")
-
-    def test_fixed_count_gets_field_dim(self):
-        s = core.spec_for_field("FORMAT", "XX", "2", "Integer")
-        assert s.dims == ("variants", "samples", "FORMAT_XX_dim")
-
-    def test_character_is_str(self):
-        s = core.spec_for_field("INFO", "C", "1", "Character")
-        assert s.kind == core.KIND_STR
-
-    def test_info_name_colliding_with_fixed_array_is_rejected(self):
-        with pytest.raises(ValueError, match="variant_position"):
-            core.spec_for_field("INFO", "position", "1", "String")
-
-    def test_format_name_colliding_with_fixed_array_is_rejected(self):
-        with pytest.raises(ValueError, match="call_genotype"):
-            core.spec_for_field("FORMAT", "genotype", "1", "String")
-
-    def test_gt_is_rejected(self):
-        with pytest.raises(ValueError, match="call_genotype"):
-            core.spec_for_field("FORMAT", "GT", "1", "String")
-
-    def test_bad_category_is_rejected(self):
-        with pytest.raises(ValueError, match="category"):
-            core.spec_for_field("FILTER", "PASS", "1", "String")
-
-    def test_bad_type_is_rejected(self):
-        with pytest.raises(ValueError, match="Type"):
-            core.spec_for_field("INFO", "X", "1", "Whatever")
-
-
-class TestSchema:
-    def make(self):
-        fields = (
-            *core.FIXED_ARRAYS.values(),
-            core.spec_for_field("INFO", "DP", "1", "Integer"),
-            core.spec_for_field("INFO", "AF", "A", "Float"),
-        )
-        dims = {
-            "variants": 100,
-            "samples": 1,
-            "ploidy": 2,
-            "alleles": 4,
-            "alt_alleles": 3,
-            "contigs": 25,
-            "filters": 1,
-            "region_index_values": 12,
-            "region_index_fields": 6,
-        }
-        return core.Schema(dims=dims, fields=fields, source="vcf", build="GRCh38")
-
-    def test_fixture_declares_every_dimension(self):
-        # make() covers all of FIXED_ARRAYS, so constructing it also proves
-        # the fixed arrays only use dimensions a real store would declare.
-        self.make()
-
-    def test_undeclared_dimension_is_rejected(self):
-        field = core.spec_for_field("INFO", "ANN", ".", "String")
-        with pytest.raises(ValueError, match="INFO_ANN_dim"):
-            core.Schema(dims={"variants": 1}, fields=(field,))
-
-    def test_roundtrips_through_json(self):
-        schema = self.make()
-        back = core.Schema.fromdict(json.loads(json.dumps(schema.asdict())))
-        assert back == schema
-
-    def test_version_mismatch_is_rejected(self):
-        d = self.make().asdict()
-        d["schema_version"] = "0.0"
-        with pytest.raises(ValueError, match="version"):
-            core.Schema.fromdict(d)
-
-    def test_field_map(self):
-        schema = self.make()
-        m = schema.field_map()
-        assert m["variant_DP"].kind == core.KIND_INT
-        assert m["variant_position"].dims == ("variants",)
+        for name, (dims, _kinds) in core.FIXED_ARRAYS.items():
+            for dim in dims:
+                assert dim in core.RESERVED_DIMS, (name, dim)

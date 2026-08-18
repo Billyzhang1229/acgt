@@ -41,6 +41,8 @@ jobs:
       matrix:
         # No Windows: cyvcf2 builds on htslib, which has no Windows wheels.
         os: [ubuntu-latest, macos-latest]
+        # Every version requires-python in pyproject.toml admits.
+        python: ["3.12", "3.13", "3.14"]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 15
     steps:
@@ -49,6 +51,7 @@ jobs:
       - uses: astral-sh/setup-uv@v6
         with:
           enable-cache: true
+          python-version: ${{ matrix.python }}
 
       - name: Install dependencies
         run: uv sync --locked
@@ -56,7 +59,7 @@ jobs:
       - name: Test
         run: uv run pytest --cov=acgt --cov-report=term-missing --cov-report=xml
 
-      # Both matrix jobs upload; Codecov merges reports for the same commit.
+      # Every matrix job uploads; Codecov merges reports for the same commit.
       - uses: codecov/codecov-action@v5
         with:
           token: ${{ secrets.CODECOV_TOKEN }}

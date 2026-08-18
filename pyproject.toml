@@ -4,13 +4,14 @@ version = "0.0.1"
 description = "Open source, open read: vectorized personal genomics, agent-ready, private by architecture"
 readme = "README.md"
 license = { file = "LICENSE" }
-requires-python = ">=3.13"
+requires-python = ">=3.12"
 dependencies = [
     "zarr",
     "numcodecs",
     "numpy",
     "xarray",
     "textual",
+    "bio2zarr",
     "cyvcf2",
 ]
 
@@ -23,7 +24,6 @@ dev = [
     "ruff",
     "ty",
     "import-linter",
-    "bio2zarr",
     "vcztools",
     "pytest-cov>=7.1.0",
     "pre-commit>=4.6.2",
