@@ -4,7 +4,7 @@ version = "0.0.1"
 description = "Open source, open read: vectorized personal genomics, agent-ready, private by architecture"
 readme = "README.md"
 license = { file = "LICENSE" }
-requires-python = ">=3.13"
+requires-python = ">=3.12"
 dependencies = [
     "zarr",
     "numcodecs",

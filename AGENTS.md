@@ -144,7 +144,8 @@ uv run ruff check && uv run ruff format
 uv run ty check
 ```
 
-ACGT targets Python 3.13.
+ACGT runs on Python 3.12 and later. 3.12 is the floor because zarr 3
+requires it; CI tests every version from there up.
 
 ## Type hints
 
