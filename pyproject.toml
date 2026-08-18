@@ -11,6 +11,7 @@ dependencies = [
     "numpy",
     "xarray",
     "textual",
+    "bio2zarr",
     "cyvcf2",
 ]
 
@@ -23,7 +24,6 @@ dev = [
     "ruff",
     "ty",
     "import-linter",
-    "bio2zarr",
     "vcztools",
     "pytest-cov>=7.1.0",
     "pre-commit>=4.6.2",

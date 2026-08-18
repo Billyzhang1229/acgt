@@ -32,17 +32,24 @@ VCZ (VCF Zarr) is the only format ACGT queries. Whatever the user supplies is
 converted to VCZ on import and is never queried directly.
 
 `convert.py` is the only place a foreign format exists. Every conversion path
-lives there: VCF/BCF from WGS or WES, and consumer array exports (23andMe,
-AncestryDNA). New source formats get another function in `convert.py`, not
-another module.
+lives there. VCF and BCF go through `bio2zarr`, the reference converter for
+the VCF Zarr spec; consumer array exports (23andMe, AncestryDNA) are turned
+into VCF by `bcftools` first and then take the same path. New source formats
+get another function in `convert.py`, not another module.
 
 Downstream of import there is one data model: an xarray Dataset backed by Zarr,
 following sgkit's variant/sample dimension conventions.
 
 - Single sample is the working assumption. Trios and cohorts are not in scope
-  yet.
+  yet; `convert.py` refuses them and `dataset.preflight` refuses a store that
+  carries more than one sample, so a cohort store cannot slip in by another
+  route.
 - Lazy by default. Slice by region; never materialize a whole array.
-- No intermediate files outside the VCZ store itself.
+- Import is done by `bio2zarr`. `from_vcf` checks that the input is in
+  scope (one sample) and hands the file over; intermediate files, an
+  existing target, and what a failed run leaves behind are bio2zarr's
+  behaviour and are not wrapped. Anything it leaves behind stays on this
+  machine, so the one rule holds.
 
 ## Core packages
 
@@ -50,9 +57,9 @@ following sgkit's variant/sample dimension conventions.
 | --- | --- |
 | Data core | `zarr`, `numcodecs`, `numpy`, `xarray` |
 | TUI | `textual` |
-| VCF parsing, import only | `cyvcf2` (current choice, not settled) |
+| VCF/BCF → VCZ, import only | `bio2zarr` (the reference converter; `cyvcf2` underneath) |
 | Dev | `pytest`, `ruff`, `ty`, `import-linter` |
-| Cross-testing | `bio2zarr`, `vcztools` |
+| Cross-testing | `vcztools` |
 
 That table is the dependency list. Add to it only when the work genuinely
 cannot be done with what is already there, and say in the commit why the
@@ -62,19 +69,22 @@ The library that parses foreign formats is imported only in `convert.py`,
 whatever that library is. The restriction exists because confinement is the
 module's whole job: foreign formats and their parser stay in one place, so
 replacing the parser touches one file and nothing downstream of import ever
-sees a foreign format. `cyvcf2` is the current parser; if it changes, this
-rule doesn't.
+sees a foreign format. `bio2zarr` (and the `cyvcf2` it parses with) is the
+current converter; if it changes, this rule doesn't.
 
-`bio2zarr` and `vcztools` are test dependencies, not runtime ones. `bio2zarr`
-converts the same VCF independently, so the suite can compare its store against
-ours; `vcztools` reads a store back out to VCF, so query results can be checked
-against the reference implementation. Neither ships in the application.
+`bio2zarr` is the converter, not a second implementation to compare against:
+it is the reference for the spec, and writing our own was tried and dropped
+because keeping it equal to the reference cost more than the speed it bought.
+What the tests hold is that `convert.py` hands the file to it faithfully and
+that the result passes `dataset.preflight`; `bio2zarr` ships a store-versus-VCF
+verifier, run on a fixture as the content check. `vcztools` is the test-only
+reader: it renders a store back out to VCF, so query results can be checked
+against the reference implementation. It does not ship in the application.
 
-That covers VCF and BCF only. Consumer array exports have no second
-implementation to compare against, so the chip path is checked by round-trip
-instead: convert to VCZ, read it back, and compare against the source parsed
-independently. That is a weaker guarantee than agreement with another
-implementation, and it should not be reported as though it were the same thing.
+Consumer array exports reach VCZ through `bcftools convert --tsv2vcf` and then
+the same path, so the same checks apply; the tsv-to-VCF step is `bcftools`'s
+to get right, and a round trip against the source export is what the tests
+can add.
 
 `bcftools` is the reference for query semantics and the baseline for timings,
 and `hyperfine` compares the two at the command line. Both are external
@@ -102,8 +112,8 @@ The package is flat: one `.py` per module, no subpackages inside it.
 acgt/                repository root
   acgt/
     __init__.py
-    core.py          what an ACGT dataset is — schema, provenance, build
-    dataset.py       open and save a VCZ store; preflight
+    core.py          what an ACGT dataset is — the contract a store must meet
+    dataset.py       open a VCZ store; preflight
     convert.py       VCF/BCF and array exports → VCZ
     query.py         gene and region queries
     annotate.py      local annotation
@@ -157,7 +167,7 @@ Simple local helpers don't need them either.
 `xr.Dataset` in particular is not worth annotating. Nearly every function in
 `dataset.py` and `query.py` takes or returns one, and the annotation says
 nothing about which variables or dimensions the store actually carries. What a
-function requires of a store is described by the schema in `core.py`, checked by
+function requires of a store is described by the contract in `core.py`, checked by
 preflight in `dataset.py`, and named in the docstring.
 
 Where you do annotate, prefer the type that describes the actual contract over
